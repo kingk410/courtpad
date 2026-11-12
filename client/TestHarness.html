@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <meta charset="utf-8">
+  <?!= include('client/Styles'); ?>
+</head>
+<body>
+<div class="harness" id="out"><h2>CourtPad engine test harness</h2></div>
+<?!= include('shared/Engine'); ?>
+<?!= include('client/TestData'); ?>
+<script>
+(function () {
+  'use strict';
+  var out = document.getElementById('out');
+  var failures = 0, checks = 0, knowns = 0;
+
+  function line(cls, text) {
+    var div = document.createElement('div');
+    div.className = cls;
+    div.textContent = text;
+    out.appendChild(div);
+  }
+  function h(text) {
+    var el = document.createElement('h2');
+    el.textContent = text;
+    out.appendChild(el);
+  }
+  function eq(actual, expected, label, known) {
+    checks++;
+    if (String(actual) !== String(expected)) {
+      if (known) { knowns++; line('known', '± ' + label + ': engine=' + actual + ' (log-correct), old sheet=' + expected); }
+      else { failures++; line('fail', '✗ ' + label + ': got ' + actual + ', want ' + expected); }
+    }
+  }
+
+  // ---------- unit checks ----------
+  h('Unit checks');
+  var setup = {
+    teams: [
+      { code: 'a', name: 'Alpha', roster: [{ num: 1, name: 'One' }, { num: 2, name: 'Two' },
+        { num: 3, name: 'Three' }, { num: 4, name: 'Four' }, { num: 5, name: 'Five' },
+        { num: 6, name: 'Bench' }], starters: [1, 2, 3, 4, 5] },
+      { code: 'b', name: 'Beta', roster: [{ num: 11, name: 'El' }, { num: 12, name: 'Doce' },
+        { num: 13, name: 'T' }, { num: 14, name: 'C' }, { num: 15, name: 'Q' }],
+        starters: [11, 12, 13, 14, 15] }
+    ], tabName: 'T', quarterMinutes: 8
+  };
+  var evs = [
+    { type: 'shot', team: 'a', num: 1, shot: 3, made: true, astBy: 2, fastbreak: true },
+    { type: 'shot', team: 'b', num: 11, shot: 2, made: false },
+    { type: 'reb', team: 'b', num: 12, kind: 'o' },
+    { type: 'shot', team: 'b', num: 11, shot: 2, made: true },
+    { type: 'stl', team: 'a', num: 3, onNum: 13 },
+    { type: 'quarterEnd' },
+    { type: 'sub', team: 'a', inNum: 6, outNum: 5 },
+    { type: 'shot', team: 'a', num: 6, shot: 2, made: true }
+  ];
+  var st = Engine.reduce(setup, evs);
+  eq(st.score.a, 5, 'score a'); eq(st.score.b, 2, 'score b');
+  eq(st.players.a['2'].AST, 1, 'assist rider');
+  eq(st.players.b['13'].TOV, 1, 'steal charges TOV');
+  eq(st.adv.a.fastbreakPts, 3, 'fastbreak pts');
+  eq(st.adv.b.secondChancePts, 2, 'auto 2nd chance');
+  eq(st.adv.a.benchPts, 2, 'bench pts');
+  eq(st.quarter, 2, 'quarter');
+  eq(st.plusMinus.a['5'], 1, 'plus-minus out player');
+  eq(st.plusMinus.a['6'], 2, 'plus-minus sub-in player');
+  var rt = Engine.fromLegacyLog(
+    Engine.setupCommands(setup).concat(evs.map(Engine.toCommandString)), { tabName: 'T' });
+  var st2 = Engine.reduce(rt.setup, rt.events);
+  eq(JSON.stringify(st2.score), JSON.stringify(st.score), 'round-trip score');
+  eq(JSON.stringify(Engine.teamTotals(st2, 'a')), JSON.stringify(Engine.teamTotals(st, 'a')),
+    'round-trip totals');
+
+  // ---------- real-game parity ----------
+  h('Real-game parity: ' + TestData.name);
+  var t0 = Date.now();
+  var parsed = Engine.fromLegacyLog(TestData.logLines, { tabName: 'HMB2' });
+  var ps = Engine.reduce(parsed.setup, parsed.events);
+  var ms = Date.now() - t0;
+  line('', 'parsed ' + TestData.logLines.length + ' log lines -> ' + parsed.events.length +
+    ' events, full replay in ' + ms + 'ms');
+
+  var exp = TestData.expected;
+  var KNOWN = {};
+  (exp.knownOldSheetBugs || []).forEach(function (k) { KNOWN[k] = true; });
+
+  exp.box.forEach(function (row) {
+    var isTotal = row.name === 'TEAM TOTAL';
+    var p = isTotal ? Engine.teamTotals(ps, row.team) : ps.players[row.team][String(row.num)];
+    if (!p) { failures++; line('fail', '✗ missing player ' + row.team + ' #' + row.num); return; }
+    for (var key in row.stats) {
+      var label = row.team + ' ' + (isTotal ? 'TOTAL' : '#' + row.num) + ' ' + key;
+      eq(p[key], row.stats[key], label, KNOWN[row.team + ' ' + (isTotal ? 'TOTAL' : '#' + row.num) + ' ' + key]);
+    }
+  });
+  ['h', 'm'].forEach(function (code) {
+    ['fastbreakPts', 'secondChancePts', 'benchPts'].forEach(function (k) {
+      eq(ps.adv[code][k], exp.adv[code][k], code + ' ' + k);
+    });
+    for (var q = 1; q <= 4; q++) {
+      var row = ps.quarterStats[code][q] || { PTS: 0, FGM: 0, FGA: 0, TOV: 0, PF: 0 };
+      var e = exp.quarters[code][q];
+      eq(row.PTS, e[0], code + ' Q' + q + ' PTS');
+      eq(row.FGM + '-' + row.FGA, e[1], code + ' Q' + q + ' FG');
+      eq(row.TOV, e[2], code + ' Q' + q + ' TOV');
+      eq(row.PF, e[3], code + ' Q' + q + ' PF');
+    }
+    eq(ps.score[code], exp.score[code], code + ' final score');
+  });
+  eq(ps.series.length, exp.series.length, 'series length');
+  for (var i = 0; i < Math.min(ps.series.length, exp.series.length); i++) {
+    eq(ps.series[i].x + ',' + ps.series[i].y, exp.series[i][0] + ',' + exp.series[i][1],
+      'series[' + i + ']');
+  }
+  eq(JSON.stringify(ps.quarterMarks), JSON.stringify(exp.quarterMarks), 'quarter marks');
+
+  h('Result');
+  var summary = checks + ' checks — ' +
+    (failures === 0 ? 'ALL PASS' : failures + ' FAILURES') +
+    (knowns ? ' (' + knowns + ' known old-sheet divergences)' : '');
+  line(failures === 0 ? 'pass' : 'fail', summary);
+})();
+</script>
+</body>
+</html>

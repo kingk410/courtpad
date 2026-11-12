@@ -1,0 +1,182 @@
+<script>
+/**
+ * Sync — localStorage persistence + debounced snapshot flushes to the server.
+ *
+ * The client is authoritative: every mutation bumps `revision`, persists the
+ * whole game locally (synchronously — a tab kill loses nothing), and schedules
+ * a flush. A flush sends the FULL truth (commands + snapshot); the server
+ * ignores anything with revision <= what it already applied, so retries and
+ * out-of-order arrivals are harmless. Taps never wait on the network.
+ *
+ * Outside Apps Script (local dev / TestHarness), `google` is undefined and
+ * flushes are mocked as instant successes.
+ */
+var Sync = (function () {
+  'use strict';
+
+  var DEBOUNCE_MS = 2500;
+  var MAX_WAIT_MS = 10000;
+  var TIMEOUT_MS = 20000;
+
+  var token = null;
+  var getPayload = null;   // () -> {gameId, revision, commands, snapshot} | null
+  var onStatus = function () { };
+
+  var dirty = false;
+  var inFlight = false;
+  var timer = null;
+  var oldestDirtyAt = null;
+  var retryDelay = 0;      // 0 = no failures yet
+  var lastError = null;
+
+  function status() {
+    if (!dirty && !inFlight) return 'green';
+    if (retryDelay > 0) return 'red';
+    return 'amber';
+  }
+
+  function notify() { onStatus(status(), lastError); }
+
+  function schedule(delay) {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(flush, delay);
+  }
+
+  function bump() {
+    dirty = true;
+    if (!oldestDirtyAt) oldestDirtyAt = Date.now();
+    var wait = DEBOUNCE_MS;
+    if (Date.now() - oldestDirtyAt > MAX_WAIT_MS - DEBOUNCE_MS) wait = 250;
+    if (!retryDelay) schedule(wait);
+    notify();
+  }
+
+  function flush() {
+    if (inFlight || !dirty) return;
+    var payload = getPayload();
+    if (!payload) { dirty = false; notify(); return; }
+
+    inFlight = true;
+    dirty = false;         // set again by any mutation during the request
+    notify();
+
+    var sentRevision = payload.revision;
+    var timedOut = false;
+    var timeoutId = setTimeout(function () {
+      timedOut = true;
+      fail('timeout');
+    }, TIMEOUT_MS);
+
+    function done(res) {
+      if (timedOut) return;
+      clearTimeout(timeoutId);
+      inFlight = false;
+      if (res && res.ok) {
+        retryDelay = 0;
+        lastError = null;
+        if (!dirty) oldestDirtyAt = null;
+        else schedule(DEBOUNCE_MS);
+      } else {
+        fail(res && res.error ? res.error : 'server error');
+        return;
+      }
+      notify();
+    }
+
+    function fail(err) {
+      clearTimeout(timeoutId);
+      inFlight = false;
+      dirty = true;
+      lastError = String(err);
+      retryDelay = retryDelay ? Math.min(retryDelay * 2, 30000) : 2000;
+      schedule(retryDelay);
+      notify();
+    }
+
+    if (typeof google !== 'undefined' && google.script && google.script.run) {
+      google.script.run
+        .withSuccessHandler(done)
+        .withFailureHandler(function (e) { if (!timedOut) fail(e && e.message || e); })
+        .api_syncGame(token, payload);
+    } else {
+      // Local dev: pretend the server applied it.
+      setTimeout(function () { done({ ok: true, applied: sentRevision }); }, 200);
+    }
+  }
+
+  /** Immediate flush (used before generating a report). Returns a Promise. */
+  function flushNow() {
+    return new Promise(function (resolve) {
+      if (!dirty && !inFlight) return resolve(true);
+      var check = setInterval(function () {
+        if (!dirty && !inFlight) { clearInterval(check); resolve(true); }
+        if (retryDelay > 0) { clearInterval(check); resolve(false); }
+      }, 300);
+      if (timer) clearTimeout(timer);
+      flush();
+    });
+  }
+
+  // ---- server call helper (non-sync APIs) ----
+  function call(fn) {
+    var args = Array.prototype.slice.call(arguments, 1);
+    return new Promise(function (resolve, reject) {
+      if (typeof google !== 'undefined' && google.script && google.script.run) {
+        var runner = google.script.run
+          .withSuccessHandler(resolve)
+          .withFailureHandler(function (e) { reject(e && e.message || e); });
+        runner[fn].apply(runner, [token].concat(args));
+      } else {
+        reject('offline (local dev): ' + fn);
+      }
+    });
+  }
+
+  // ---- localStorage persistence ----
+  var LS_PREFIX = 'courtpad.';
+
+  function saveLocal(game) {
+    try {
+      localStorage.setItem(LS_PREFIX + 'game.' + game.gameId, JSON.stringify(game));
+      localStorage.setItem(LS_PREFIX + 'current', game.gameId);
+    } catch (e) { /* storage full/blocked — sync still protects the game */ }
+  }
+
+  function loadLocal(gameId) {
+    try {
+      var raw = localStorage.getItem(LS_PREFIX + 'game.' + gameId);
+      return raw ? JSON.parse(raw) : null;
+    } catch (e) { return null; }
+  }
+
+  function currentGameId() {
+    try { return localStorage.getItem(LS_PREFIX + 'current'); } catch (e) { return null; }
+  }
+
+  function clearCurrent() {
+    try { localStorage.removeItem(LS_PREFIX + 'current'); } catch (e) { }
+  }
+
+  function getPref(key, fallback) {
+    try { return localStorage.getItem(LS_PREFIX + key) || fallback; } catch (e) { return fallback; }
+  }
+
+  function setPref(key, value) {
+    try { localStorage.setItem(LS_PREFIX + key, value); } catch (e) { }
+  }
+
+  function init(tok, payloadFn, statusFn) {
+    token = tok;
+    getPayload = payloadFn;
+    onStatus = statusFn || onStatus;
+    notify();
+  }
+
+  return {
+    init: init, bump: bump, flushNow: flushNow, call: call,
+    saveLocal: saveLocal, loadLocal: loadLocal,
+    currentGameId: currentGameId, clearCurrent: clearCurrent,
+    getPref: getPref, setPref: setPref
+  };
+})();
+</script>

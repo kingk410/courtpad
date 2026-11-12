@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <meta charset="utf-8">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <?!= include('client/Styles'); ?>
+</head>
+<body>
+<div id="app">
+
+  <!-- ================= HOME ================= -->
+  <div class="screen active" id="screen-home">
+    <div class="center">
+      <div class="homecard">
+        <h1>🏀 CourtPad</h1>
+        <button class="bigbtn" id="home-resume" style="display:none">Resume game</button>
+        <button class="bigbtn secondary" id="home-new">New game</button>
+        <button class="bigbtn secondary" id="home-plays">🧩 Plays…</button>
+        <h2>Recent games</h2>
+        <div id="home-games"><div class="muted">Loading…</div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ================= SETUP ================= -->
+  <div class="screen" id="screen-setup">
+    <div class="topbar">
+      <button class="topbtn" id="setup-back">‹ Back</button>
+      <div class="spacer"></div>
+      <button class="topbtn" id="setup-create" style="background:var(--accent)">Create game</button>
+    </div>
+    <div class="setupwrap">
+      <div class="setupgrid">
+        <div class="setupcard full">
+          <label>Game name (spreadsheet tab)</label>
+          <input type="text" id="su-tabname" placeholder="Menlo vs HMB">
+          <div style="display:flex; gap:14px; flex-wrap:wrap; align-items:center">
+            <div class="radio"><input type="radio" name="su-ss" id="su-ss-last" checked>
+              <label for="su-ss-last" style="text-transform:none" id="su-ss-last-label">Same spreadsheet as last game</label></div>
+            <div class="radio"><input type="radio" name="su-ss" id="su-ss-new">
+              <label for="su-ss-new" style="text-transform:none">New spreadsheet named:</label></div>
+            <input type="text" id="su-ssname" placeholder="2026-27 Gamelog" style="width:220px">
+            <div class="radio" style="margin-left:auto">
+              <label style="text-transform:none">Quarter length (min)</label>
+              <input type="number" id="su-qmin" value="8" min="1" max="20" style="width:70px">
+            </div>
+          </div>
+        </div>
+        <div class="setupcard" id="su-team0">
+          <label>My team</label>
+          <div style="display:flex; gap:8px">
+            <input type="text" class="su-name" placeholder="Team name" style="flex:1">
+            <input type="text" class="su-code" placeholder="code" maxlength="2" style="width:70px">
+            <select class="su-saved" style="width:150px"><option value="">Saved…</option></select>
+          </div>
+          <label>Roster — one per line: <span style="text-transform:none">number name</span></label>
+          <textarea class="su-roster" placeholder="23 Alex Smith&#10;11 Jordan Lee"></textarea>
+          <label>Tap 5 starters</label>
+          <div class="chips su-starters"></div>
+        </div>
+        <div class="setupcard" id="su-team1">
+          <label>Opponent</label>
+          <div style="display:flex; gap:8px">
+            <input type="text" class="su-name" placeholder="Team name" style="flex:1">
+            <input type="text" class="su-code" placeholder="code" maxlength="2" style="width:70px">
+            <select class="su-saved" style="width:150px"><option value="">Saved…</option></select>
+          </div>
+          <label>Roster — one per line: <span style="text-transform:none">number name</span></label>
+          <textarea class="su-roster"></textarea>
+          <label>Tap 5 starters</label>
+          <div class="chips su-starters"></div>
+        </div>
+        <div class="setupcard full">
+          <div class="muted" id="su-status"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ================= GAME ================= -->
+  <div class="screen" id="screen-game">
+    <div class="topbar">
+      <div class="scoreline">
+        <span class="team" id="g-nameA"></span><span class="pts" id="g-ptsA">0</span>
+        <span class="dash">—</span>
+        <span class="pts" id="g-ptsB">0</span><span class="team" id="g-nameB"></span>
+      </div>
+      <button class="qchip" id="g-qchip">Q1</button>
+      <button class="qchip" id="g-clock" style="min-width:100px">▶ 8:00</button>
+      <div class="spacer"></div>
+      <div class="syncdot" id="g-syncdot" title="sync status"></div>
+      <button class="topbtn undo" id="g-undo">↩ Undo</button>
+      <button class="topbtn" id="g-menu">≡</button>
+    </div>
+    <div class="gamebody">
+      <div class="teamcol left teamA">
+        <h3><span id="g-colnameA"></span><button class="subbtn" id="g-subA">SUB</button></h3>
+        <div id="g-playersA"></div>
+      </div>
+      <div class="actioncol">
+        <div class="selline" id="g-selline">Tap a player</div>
+        <div class="actiongrid">
+          <button class="abtn make" data-act="2make">2PT ✓</button>
+          <button class="abtn miss" data-act="2miss">2PT ✗</button>
+          <button class="abtn make" data-act="3make">3PT ✓</button>
+          <button class="abtn miss" data-act="3miss">3PT ✗</button>
+          <button class="abtn make small" data-act="ftmake">FT ✓</button>
+          <button class="abtn miss small" data-act="ftmiss">FT ✗</button>
+          <button class="abtn small" data-act="oreb">OREB</button>
+          <button class="abtn small" data-act="dreb">DREB</button>
+          <button class="abtn small" data-act="ast">AST</button>
+          <button class="abtn small" data-act="stl">STL</button>
+          <button class="abtn small" data-act="blk">BLK</button>
+          <button class="abtn small" data-act="tov">TOV</button>
+          <button class="abtn small" data-act="pf">FOUL</button>
+          <button class="abtn small" data-act="chg">CHG</button>
+          <button class="abtn small" data-act="dfl">DEFL</button>
+          <button class="abtn small" data-act="pfd">PFD</button>
+        </div>
+        <div class="chips" id="g-plays" style="display:none"></div>
+        <div class="togglerow">
+          <button class="tbtn" id="g-fb">⚡ Fastbreak</button>
+          <button class="tbtn" id="g-2nd">2nd chance: auto</button>
+        </div>
+        <div class="followup" id="g-followup">
+          <div class="fq" id="g-fq"></div>
+          <div class="fopts" id="g-fopts"></div>
+        </div>
+      </div>
+      <div class="teamcol right teamB">
+        <h3><span id="g-colnameB"></span><button class="subbtn" id="g-subB">SUB</button></h3>
+        <div id="g-playersB"></div>
+      </div>
+    </div>
+    <div class="ticker">
+      <div class="events" id="g-ticker"></div>
+      <button class="topbtn" id="g-openlog">Log ▸</button>
+    </div>
+  </div>
+
+  <!-- ================= EVENT LOG ================= -->
+  <div class="screen" id="screen-log">
+    <div class="topbar">
+      <button class="topbtn" id="log-back">‹ Game</button>
+      <div class="spacer"></div>
+      <div class="muted" id="log-count"></div>
+    </div>
+    <div class="logwrap">
+      <div id="log-playstats"></div>
+      <div id="log-list"></div>
+    </div>
+  </div>
+
+</div>
+
+<!-- ================= MODALS ================= -->
+<div class="modal" id="modal-court">
+  <div class="modalbox">
+    <h4 id="court-title">Where was the shot?</h4>
+    <div class="courtwrap">
+      <svg id="court-svg" width="440" height="414" viewBox="0 0 50 47">
+        <rect x="0" y="0" width="50" height="47" fill="#20303c" stroke="#5b7285" stroke-width="0.4"/>
+        <rect x="19" y="0" width="12" height="19" fill="none" stroke="#5b7285" stroke-width="0.3"/>
+        <circle cx="25" cy="19" r="6" fill="none" stroke="#5b7285" stroke-width="0.3"/>
+        <line x1="22" y1="4" x2="28" y2="4" stroke="#8fa8bd" stroke-width="0.5"/>
+        <circle cx="25" cy="5.25" r="0.75" fill="none" stroke="#e8a13c" stroke-width="0.35"/>
+        <path d="M 5.96 0 A 19.75 19.75 0 0 0 44.04 0" fill="none" stroke="#5b7285" stroke-width="0.35"/>
+        <line x1="0" y1="47" x2="50" y2="47" stroke="#5b7285" stroke-width="0.5"/>
+      </svg>
+    </div>
+    <div class="modalrow">
+      <button class="fbtn dismiss" id="court-skip">Skip</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal" id="modal-menu">
+  <div class="modalbox" style="min-width:300px">
+    <h4>Menu</h4>
+    <button class="bigbtn secondary" id="m-sheet">Open spreadsheet</button>
+    <button class="bigbtn secondary" id="m-half">📄 Halftime report</button>
+    <button class="bigbtn secondary" id="m-final">📄 Final report</button>
+    <button class="bigbtn secondary" id="m-sync">Force sync now</button>
+    <button class="bigbtn secondary" id="m-home">⏏ Leave game (home)</button>
+    <button class="bigbtn secondary" id="m-close">Close</button>
+    <div class="muted" id="m-status"></div>
+  </div>
+</div>
+
+<div class="modal" id="modal-plays">
+  <div class="modalbox" style="min-width:340px">
+    <h4>Plays</h4>
+    <div class="muted">One play per line. These show as buttons during games —
+      tap one when you call it, and scoring/turnovers on that possession count
+      toward the play's stats.</div>
+    <textarea id="plays-text" style="min-height:180px; font:inherit; background:var(--panel2);
+      color:var(--text); border:1px solid var(--line); border-radius:8px; padding:10px;
+      -webkit-user-select:text; user-select:text"></textarea>
+    <div class="modalrow">
+      <button class="fbtn dismiss" id="plays-close">Cancel</button>
+      <button class="fbtn" id="plays-save" style="background:var(--accent)">Save</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal" id="modal-confirm">
+  <div class="modalbox" style="min-width:300px">
+    <h4 id="confirm-text"></h4>
+    <div class="modalrow">
+      <button class="fbtn dismiss" id="confirm-no">Cancel</button>
+      <button class="fbtn" id="confirm-yes" style="background:var(--accent)">Confirm</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast"><span id="toast-text"></span><button id="toast-action" style="display:none"></button></div>
+
+<?!= include('shared/Engine'); ?>
+<?!= include('client/Sync'); ?>
+<?!= include('client/Setup'); ?>
+<?!= include('client/App'); ?>
+<script>
+  var TOKEN = '<?= token ?>';
+  App.init();
+</script>
+</body>
+</html>

@@ -1,0 +1,765 @@
+<script>
+/**
+ * CourtPad stat engine. Pure JS, no DOM, no google.* — runs in the browser
+ * (and in Node for the test harness). Ported from Livestat's
+ * CommandProcessor.js applyCommand/buildQuarterStats/buildAdvancedStatsFromLog,
+ * re-keyed from command strings to structured events.
+ *
+ * Event shapes (all have: id, seq, team; player events add num):
+ *   {type:'shot', team, num, shot:1|2|3, made, astBy?, fastbreak?, secondChance?(true|false|null), loc?:{x,y}}
+ *     shot:1 = free throw
+ *   {type:'reb',  team, num, kind:'o'|'d'}
+ *   {type:'ast'|'stl'|'blk'|'tov'|'pf'|'chg'|'dfl'|'pfd', team, num, onNum?, onShot?}
+ *     stl.onNum: opponent charged a TOV; blk.onNum+onShot: opponent charged a FGA
+ *   {type:'sub', team, inNum, outNum}
+ *   {type:'quarterEnd'}
+ *   {type:'comment', text}
+ *
+ * Setup shape:
+ *   {teams:[{code, name, roster:[{num, name}], starters:[num x5]}, x2],
+ *    tabName, quarterMinutes}
+ */
+var Engine = (function () {
+  'use strict';
+
+  var STAT_KEYS = ['FGM', 'FGA', 'TWO_PM', 'TWO_PA', 'THREE_PM', 'THREE_PA',
+    'FTM', 'FTA', 'OREB', 'DREB', 'AST', 'STL', 'BLK', 'TOV', 'PF', 'PTS',
+    'CHG', 'DEFL', 'PFD'];
+
+  function emptyStats() {
+    var s = {};
+    for (var i = 0; i < STAT_KEYS.length; i++) s[STAT_KEYS[i]] = 0;
+    return s;
+  }
+
+  function shotPoints(ev) { return ev.shot === 1 ? 1 : ev.shot; }
+
+  function otherTeam(state, team) {
+    for (var i = 0; i < state.teamCodes.length; i++) {
+      if (state.teamCodes[i] !== team) return state.teamCodes[i];
+    }
+    return null;
+  }
+
+  function getPlayer(state, team, num) {
+    var t = state.players[team];
+    if (!t) { t = state.players[team] = {}; }
+    var key = String(num);
+    if (!t[key]) t[key] = emptyStats();
+    return t[key];
+  }
+
+  function getQuarterRow(state, team) {
+    var t = state.quarterStats[team];
+    if (!t) t = state.quarterStats[team] = {};
+    var q = state.quarter;
+    if (!t[q]) t[q] = { PTS: 0, FGM: 0, FGA: 0, TOV: 0, PF: 0 };
+    return t[q];
+  }
+
+  function newState(setup) {
+    var state = {
+      teamCodes: [], teamNames: {}, players: {}, playerNames: {},
+      starters: {}, onCourt: {}, quarter: 1, maxQuarter: 1,
+      quarterStats: {}, adv: {}, secondChanceTeam: null,
+      score: {}, series: [], quarterMarks: [], scoringIdx: 0,
+      shots: [], plusMinus: {}, tick: 0, quarterTicks: [{ q: 1, start: 0, end: 0 }],
+      stints: {} // team -> num -> [{startTick, endTick|null}]
+    };
+    for (var i = 0; i < setup.teams.length; i++) {
+      var t = setup.teams[i];
+      state.teamCodes.push(t.code);
+      state.teamNames[t.code] = t.name || t.code.toUpperCase();
+      state.players[t.code] = {};
+      state.playerNames[t.code] = {};
+      state.plusMinus[t.code] = {};
+      state.stints[t.code] = {};
+      state.quarterStats[t.code] = {};
+      state.adv[t.code] = { fastbreakPts: 0, secondChancePts: 0, benchPts: 0 };
+      state.score[t.code] = 0;
+      for (var j = 0; j < (t.roster || []).length; j++) {
+        var p = t.roster[j];
+        state.playerNames[t.code][String(p.num)] = p.name || '';
+        state.players[t.code][String(p.num)] = emptyStats();
+        state.plusMinus[t.code][String(p.num)] = 0;
+      }
+      var starters = (t.starters || []).map(String);
+      state.starters[t.code] = starters;
+      state.onCourt[t.code] = starters.slice();
+      for (var k = 0; k < starters.length; k++) {
+        state.stints[t.code][starters[k]] =
+          [{ startTick: 0, endTick: null, startQ: 1, startClk: 0, endQ: null, endClk: null }];
+      }
+    }
+    state.quarterClkEnds = {}; // quarter -> elapsed seconds when it ended (from ev.clk)
+    state.playStats = {};      // play name -> {calls, points, tovs, scored}
+    state.playOrder = [];      // first-called order, for display
+    state.playWindow = null;   // {name, team, points} — open play possession
+    state.playFtGrace = null;  // {name, team, num} — and-1 FTs after the play's made FG
+    return state;
+  }
+
+  // ---- Play tracking -------------------------------------------------------
+  // A 'play' event opens a possession window for the calling team. Points
+  // scored while it's open credit the play; the window closes when the
+  // possession ends: made FG (with an and-1 FT grace), turnover/charge/steal,
+  // defensive rebound by either side, any opponent shot, or end of quarter.
+  // An offensive rebound keeps the possession (and the play) alive.
+
+  function closePlay(state, how) {
+    var w = state.playWindow;
+    if (!w) return;
+    var st = state.playStats[w.name];
+    st.points += w.points;
+    if (w.points > 0) st.scored++;
+    if (how === 'tov') st.tovs++;
+    state.playWindow = null;
+  }
+
+  function updatePlayWindow(state, ev) {
+    // And-1 grace: FTs by the scorer right after the play's made FG. The
+    // foul itself (and other non-possession events) is logged in between,
+    // so those don't break the grace; anything possession-changing does.
+    if (state.playFtGrace) {
+      var g = state.playFtGrace;
+      if (ev.type === 'shot' && ev.shot === 1 && ev.team === g.team &&
+        String(ev.num) === String(g.num)) {
+        if (ev.made) {
+          state.playStats[g.name].points += 1;
+        }
+        return; // grace survives a multi-FT sequence
+      }
+      if (['pf', 'pfd', 'dfl', 'sub', 'ast'].indexOf(ev.type) === -1) {
+        state.playFtGrace = null;
+      }
+    }
+
+    var w = state.playWindow;
+    if (!w) return;
+    var mine = ev.team === w.team;
+
+    switch (ev.type) {
+      case 'shot':
+        if (mine) {
+          if (ev.shot === 1) {
+            if (ev.made) w.points += 1; // FTs during the possession
+          } else if (ev.made) {
+            w.points += ev.shot;
+            var name = w.name, num = ev.num, team = w.team;
+            closePlay(state, 'score');
+            state.playFtGrace = { name: name, team: team, num: num };
+          }
+          // own miss: keep open — rebound pending
+        } else {
+          closePlay(state, null); // opponent shooting => possession is over
+        }
+        break;
+      case 'tov':
+        closePlay(state, mine ? 'tov' : null);
+        break;
+      case 'chg': // charge TAKEN by the opponent = offensive foul on us
+        closePlay(state, mine ? null : 'tov');
+        break;
+      case 'stl': // opponent steal = our turnover; own steal = stale window
+        closePlay(state, mine ? null : 'tov');
+        break;
+      case 'reb':
+        if (mine && ev.kind === 'o') break; // our OREB keeps the play alive
+        closePlay(state, null);
+        break;
+      case 'quarterEnd':
+        closePlay(state, null);
+        break;
+      // pf / pfd / dfl / blk / ast / sub: possession continues
+    }
+  }
+
+  /**
+   * Per-play summary for display/sheet/report — folds in the still-open
+   * window so live numbers are current. scoreRate is a 0-1 ratio.
+   */
+  function playSummary(state) {
+    var out = [];
+    var w = state.playWindow;
+    state.playOrder.forEach(function (name) {
+      var s = state.playStats[name];
+      var points = s.points + (w && w.name === name ? w.points : 0);
+      var scored = s.scored + (w && w.name === name && w.points > 0 ? 1 : 0);
+      out.push({
+        name: name, calls: s.calls, points: points, tovs: s.tovs,
+        ppp: s.calls ? Math.round(points / s.calls * 100) / 100 : 0,
+        scoreRate: s.calls ? scored / s.calls : 0
+      });
+    });
+    return out;
+  }
+
+  // Credit/debit plus-minus to everyone currently on the floor.
+  function creditPlusMinus(state, scoringTeam, pts) {
+    for (var i = 0; i < state.teamCodes.length; i++) {
+      var code = state.teamCodes[i];
+      var sign = (code === scoringTeam) ? pts : -pts;
+      var on = state.onCourt[code] || [];
+      for (var j = 0; j < on.length; j++) {
+        var key = String(on[j]);
+        state.plusMinus[code][key] = (state.plusMinus[code][key] || 0) + sign;
+      }
+    }
+  }
+
+  function recordScore(state, team, pts) {
+    state.score[team] += pts;
+    creditPlusMinus(state, team, pts);
+  }
+
+  // Score-differential series: only MADE shots advance x ("Scoring Event #"),
+  // verified against Livestat's rendered ScoreGraphData for a real game.
+  function pushSeriesPoint(state) {
+    state.scoringIdx++;
+    var base = state.teamCodes[0];
+    var diff = state.score[base];
+    for (var i = 1; i < state.teamCodes.length; i++) diff -= state.score[state.teamCodes[i]];
+    state.series.push({ x: state.scoringIdx, y: diff });
+  }
+
+  function applyShot(state, ev) {
+    var p = getPlayer(state, ev.team, ev.num);
+    var pts = shotPoints(ev);
+    var isFG = ev.shot !== 1;
+    var qRow = getQuarterRow(state, ev.team);
+
+    // Second-chance decision happens against the window as it stood BEFORE
+    // this shot mutates it (Livestat's state machine, CommandProcessor.js).
+    var windowOpenForShooter = state.secondChanceTeam === ev.team;
+
+    if (isFG) {
+      p.FGA++; qRow.FGA++;
+      if (ev.shot === 2) p.TWO_PA++; else p.THREE_PA++;
+    } else {
+      p.FTA++;
+    }
+
+    if (ev.made) {
+      if (isFG) {
+        p.FGM++; qRow.FGM++;
+        if (ev.shot === 2) p.TWO_PM++; else p.THREE_PM++;
+      } else {
+        p.FTM++;
+      }
+      p.PTS += pts;
+      qRow.PTS += pts;
+      recordScore(state, ev.team, pts);
+
+      if (ev.fastbreak) state.adv[ev.team].fastbreakPts += pts;
+
+      var second = ev.secondChance === true ||
+        (ev.secondChance !== false && windowOpenForShooter);
+      if (second) state.adv[ev.team].secondChancePts += pts;
+
+      var starters = state.starters[ev.team] || [];
+      if (starters.length && starters.indexOf(String(ev.num)) === -1) {
+        state.adv[ev.team].benchPts += pts;
+      }
+
+      if (ev.astBy != null && isFG) {
+        getPlayer(state, ev.team, ev.astBy).AST++;
+      }
+    }
+
+    // Window transitions: a made FG ends the possession; any FG attempt by the
+    // non-window team ends the window; FTs never touch it (Livestat parity).
+    if (isFG) {
+      if (ev.made) state.secondChanceTeam = null;
+      else if (!windowOpenForShooter) state.secondChanceTeam = null;
+    }
+
+    if (ev.made) pushSeriesPoint(state);
+
+    if (isFG && ev.loc) {
+      state.shots.push({
+        team: ev.team, num: String(ev.num), quarter: state.quarter,
+        shot: ev.shot, made: !!ev.made, x: ev.loc.x, y: ev.loc.y
+      });
+    }
+  }
+
+  function closeStint(state, team, num, tick, clk) {
+    var list = (state.stints[team] || {})[String(num)] || [];
+    for (var i = list.length - 1; i >= 0; i--) {
+      if (list[i].endTick === null) {
+        list[i].endTick = tick;
+        list[i].endQ = state.quarter;
+        list[i].endClk = (clk == null ? null : clk);
+        return;
+      }
+    }
+  }
+
+  function openStint(state, team, num, tick, clk) {
+    if (!state.stints[team]) state.stints[team] = {};
+    var key = String(num);
+    if (!state.stints[team][key]) state.stints[team][key] = [];
+    state.stints[team][key].push({
+      startTick: tick, endTick: null,
+      startQ: state.quarter, startClk: (clk == null ? null : clk),
+      endQ: null, endClk: null
+    });
+  }
+
+  function applyEvent(state, ev) {
+    if (ev.type !== 'comment' && ev.type !== 'play') updatePlayWindow(state, ev);
+    switch (ev.type) {
+      case 'comment':
+        return;
+      case 'play': {
+        closePlay(state, null);
+        state.playFtGrace = null;
+        if (!state.playStats[ev.name]) {
+          state.playStats[ev.name] = { calls: 0, points: 0, tovs: 0, scored: 0 };
+          state.playOrder.push(ev.name);
+        }
+        state.playStats[ev.name].calls++;
+        state.playWindow = { name: ev.name, team: ev.team, points: 0 };
+        return;
+      }
+      case 'quarterEnd': {
+        var qt = state.quarterTicks[state.quarterTicks.length - 1];
+        qt.end = state.tick;
+        if (ev.clk != null) state.quarterClkEnds[state.quarter] = ev.clk;
+        state.quarterMarks.push(state.scoringIdx + 0.5);
+        state.quarter++;
+        if (state.quarter > state.maxQuarter) state.maxQuarter = state.quarter;
+        state.quarterTicks.push({ q: state.quarter, start: state.tick, end: state.tick });
+        state.secondChanceTeam = null;
+        return;
+      }
+      case 'sub': {
+        state.tick++;
+        var on = state.onCourt[ev.team] || [];
+        var outIdx = on.indexOf(String(ev.outNum));
+        if (outIdx !== -1) on[outIdx] = String(ev.inNum); else on.push(String(ev.inNum));
+        closeStint(state, ev.team, ev.outNum, state.tick, ev.clk);
+        openStint(state, ev.team, ev.inNum, state.tick, ev.clk);
+        return;
+      }
+    }
+
+    // All remaining types are per-player stat events; they advance the
+    // possession "tick" used for estimated minutes.
+    state.tick++;
+    var p = getPlayer(state, ev.team, ev.num);
+    var qRow;
+
+    switch (ev.type) {
+      case 'shot':
+        applyShot(state, ev);
+        break;
+      case 'reb':
+        if (ev.kind === 'o') { p.OREB++; state.secondChanceTeam = ev.team; }
+        else { p.DREB++; state.secondChanceTeam = null; }
+        break;
+      case 'ast':
+        p.AST++;
+        break;
+      case 'stl': {
+        p.STL++;
+        state.secondChanceTeam = null;
+        if (ev.onNum != null) {
+          var opp = otherTeam(state, ev.team);
+          if (opp) {
+            getPlayer(state, opp, ev.onNum).TOV++;
+            // Fix over Livestat: the charged TOV always reaches the quarter
+            // table (the old code dropped it if the opponent had no row yet).
+            getQuarterRow(state, opp).TOV++;
+          }
+        }
+        break;
+      }
+      case 'blk': {
+        p.BLK++;
+        if (ev.onNum != null && (ev.onShot === 2 || ev.onShot === 3)) {
+          var opp2 = otherTeam(state, ev.team);
+          if (opp2) {
+            var shooter = getPlayer(state, opp2, ev.onNum);
+            shooter.FGA++;
+            if (ev.onShot === 2) shooter.TWO_PA++; else shooter.THREE_PA++;
+            // Fix over Livestat: keep quarter-table FGA consistent with the box score.
+            getQuarterRow(state, opp2).FGA++;
+          }
+        }
+        break;
+      }
+      case 'tov':
+        p.TOV++;
+        getQuarterRow(state, ev.team).TOV++;
+        state.secondChanceTeam = null;
+        break;
+      case 'pf':
+        p.PF++;
+        getQuarterRow(state, ev.team).PF++;
+        break;
+      case 'chg':
+        p.CHG++;
+        state.secondChanceTeam = null;
+        break;
+      case 'dfl':
+        p.DEFL++;
+        break;
+      case 'pfd':
+        p.PFD++;
+        break;
+    }
+  }
+
+  /**
+   * Minutes. Two data sources, chosen per quarter:
+   *
+   * CLOCK (preferred): the app runs a play/pause game clock and stamps every
+   * event with `clk` = elapsed clock seconds in the current quarter. A
+   * completed quarter is rescaled so its clocked length equals the real
+   * quarter length (quarterMinutes) — so imperfect pausing self-corrects at
+   * every quarter boundary. The in-progress quarter uses raw clock seconds
+   * (live.clk = the clock reading "now").
+   *
+   * TICK (fallback, e.g. legacy games): the quarter's length is spread
+   * uniformly over its stat-event ticks; a player's share of ticks is their
+   * share of minutes.
+   */
+  function computeMinutes(state, quarterMinutes, live) {
+    var qm = quarterMinutes || 8;
+    var liveClk = (live && live.clk != null) ? live.clk : null;
+    var currentQ = state.quarter;
+
+    // Tick-domain quarter bounds, with the running quarter closed at "now".
+    var qts = state.quarterTicks.map(function (qt, i) {
+      var end = (i === state.quarterTicks.length - 1) ? state.tick : qt.end;
+      return { q: qt.q, start: qt.start, end: end };
+    });
+    var qtByQ = {};
+    qts.forEach(function (qt) { qtByQ[qt.q] = qt; });
+
+    // Clock-domain end of each quarter (0/undefined => no clock data there).
+    function quarterEndClk(q) {
+      if (q < currentQ) return state.quarterClkEnds[q] || 0;
+      return liveClk != null ? liveClk : 0;
+    }
+
+    function spanMinutesInQuarter(span, q) {
+      var spanEndQ = span.endQ === null ? currentQ : span.endQ;
+      if (q < span.startQ || q > spanEndQ) return 0;
+
+      var endOfQ = quarterEndClk(q);
+      var inClk = (q === span.startQ) ? span.startClk : 0;
+      var outClk = (q === spanEndQ && span.endQ !== null) ? span.endClk : endOfQ;
+      var clockUsable = endOfQ > 0 && inClk != null && outClk != null;
+
+      if (clockUsable) {
+        var secs = Math.max(0, outClk - inClk);
+        if (q < currentQ) return (secs / endOfQ) * qm;   // rescaled to true length
+        return secs / 60;                                // live quarter: raw
+      }
+
+      // Tick fallback for this quarter.
+      var qt = qtByQ[q];
+      if (!qt) return 0;
+      var len = qt.end - qt.start;
+      if (len <= 0) return 0;
+      var a = span.startTick;
+      var b = span.endTick === null ? state.tick : span.endTick;
+      var overlap = Math.min(b, qt.end) - Math.max(a, qt.start);
+      return overlap > 0 ? (overlap / len) * qm : 0;
+    }
+
+    var minutes = {};
+    for (var ti = 0; ti < state.teamCodes.length; ti++) {
+      var code = state.teamCodes[ti];
+      minutes[code] = {};
+      var stints = state.stints[code] || {};
+      for (var num in stints) {
+        var total = 0;
+        var spans = stints[num];
+        for (var s = 0; s < spans.length; s++) {
+          var spanEndQ = spans[s].endQ === null ? currentQ : spans[s].endQ;
+          for (var q = spans[s].startQ; q <= spanEndQ; q++) {
+            total += spanMinutesInQuarter(spans[s], q);
+          }
+        }
+        minutes[code][num] = Math.round(total * 10) / 10;
+      }
+    }
+    return minutes;
+  }
+
+  function reduce(setup, events, live) {
+    var state = newState(setup);
+    for (var i = 0; i < events.length; i++) applyEvent(state, events[i]);
+    state.minutes = computeMinutes(state, setup.quarterMinutes, live);
+    return state;
+  }
+
+  function teamTotals(state, team) {
+    var tot = emptyStats();
+    var players = state.players[team] || {};
+    for (var num in players) {
+      for (var i = 0; i < STAT_KEYS.length; i++) {
+        tot[STAT_KEYS[i]] += players[num][STAT_KEYS[i]];
+      }
+    }
+    return tot;
+  }
+
+  function pct(made, att) { return att > 0 ? made / att : 0; }
+
+  function quarterLabel(q) { return q <= 4 ? 'Q' + q : 'OT' + (q - 4); }
+
+  // ---- Legacy command-string serialization (Log tab audit trail) ----
+
+  function toCommandString(ev) {
+    var cmd = baseCommandString_(ev);
+    // Clock stamp (elapsed seconds in the quarter) rides along as `cNNN`.
+    if (ev.clk != null && ev.type !== 'comment') cmd += ' c' + Math.round(ev.clk);
+    return cmd;
+  }
+
+  function baseCommandString_(ev) {
+    switch (ev.type) {
+      case 'comment': return '# ' + (ev.text || '');
+      case 'quarterEnd': return '!quarter';
+      case 'sub': return ev.team + ' sub ' + ev.inNum + ' ' + ev.outNum;
+      case 'play': return ev.team + ' play ' + (ev.name || '');
+      case 'shot': {
+        var parts = [ev.team, ev.num, ev.shot === 1 ? 'ft' : String(ev.shot),
+          ev.made ? 'make' : 'miss'];
+        if (ev.made && ev.astBy != null && ev.shot !== 1) parts.push('ast', ev.astBy);
+        if (ev.fastbreak) parts.push('f');
+        if (ev.secondChance === true) parts.push('s');
+        if (ev.secondChance === false) parts.push('ns');
+        if (ev.loc) parts.push('@' + Math.round(ev.loc.x) + ',' + Math.round(ev.loc.y));
+        return parts.join(' ');
+      }
+      case 'reb': return ev.team + ' ' + ev.num + ' ' + (ev.kind === 'o' ? 'oreb' : 'dreb');
+      case 'stl':
+        return ev.team + ' ' + ev.num + ' stl' + (ev.onNum != null ? ' on ' + ev.onNum : '');
+      case 'blk':
+        return ev.team + ' ' + ev.num + ' blk' +
+          (ev.onNum != null ? ' on ' + ev.onNum + ' ' + ev.onShot : '');
+      case 'ast': case 'tov': case 'pf': case 'chg': case 'dfl': case 'pfd':
+        return ev.team + ' ' + ev.num + ' ' + ev.type;
+      default: return '# unknown event';
+    }
+  }
+
+  // Header meta lines regenerating Livestat's game-setup grammar.
+  function setupCommands(setup) {
+    var lines = [];
+    for (var i = 0; i < setup.teams.length; i++) {
+      var t = setup.teams[i];
+      lines.push(t.code + ' aka ' + t.name);
+      for (var j = 0; j < (t.roster || []).length; j++) {
+        var p = t.roster[j];
+        if (p.name) lines.push(t.code + ' ' + p.num + ' ' + p.name);
+      }
+      if ((t.starters || []).length === 5) {
+        lines.push(t.code + ' starters ' + t.starters.join(' '));
+      }
+    }
+    return lines;
+  }
+
+  // ---- Legacy command-string parsing (parity harness + disaster recovery) ----
+
+  function isMake(tok) { return ['make', 'made', 'good', 'mk'].indexOf(tok) !== -1; }
+  function isMiss(tok) { return ['miss', 'ms', 'missed'].indexOf(tok) !== -1; }
+
+  /**
+   * Parse one Livestat log line. Returns
+   *   {event} | {meta:{...}} | {skip:true} | {error}
+   * Meta lines (aka/starters/name/@team) describe setup, not gameplay.
+   */
+  function parseCommand(line) {
+    var raw = String(line || '').trim();
+    if (!raw) return { skip: true };
+    if (raw.charAt(0) === '#') return { event: { type: 'comment', text: raw.slice(1).trim() } };
+    if (raw.charAt(0) === '@') return { meta: { kind: 'teamToggle', team: raw.slice(1) } };
+
+    // Pull out a clock stamp token (`cNNN`) wherever it appears.
+    var clk = null;
+    var tokens = raw.split(/\s+/).filter(function (t) {
+      var m = /^c(\d+)$/.exec(t);
+      if (m && clk === null) { clk = parseInt(m[1], 10); return false; }
+      return true;
+    });
+    function withClk(ev) {
+      if (clk !== null) ev.clk = clk;
+      return { event: ev };
+    }
+
+    if (tokens[0] === '!quarter') return withClk({ type: 'quarterEnd' });
+
+    var team = tokens[0].toLowerCase();
+
+    if (tokens[1] && tokens[1].toLowerCase() === 'aka') {
+      return { meta: { kind: 'aka', team: team, name: tokens.slice(2).join(' ') } };
+    }
+    if (tokens[1] && tokens[1].toLowerCase() === 'starters') {
+      return { meta: { kind: 'starters', team: team, nums: tokens.slice(2) } };
+    }
+    if (tokens[1] && tokens[1].toLowerCase() === 'sub') {
+      return withClk({ type: 'sub', team: team, inNum: tokens[2], outNum: tokens[3] });
+    }
+    if (tokens[1] && tokens[1].toLowerCase() === 'play') {
+      return withClk({ type: 'play', team: team, name: tokens.slice(2).join(' ') });
+    }
+
+    var num = tokens[1];
+    var action = (tokens[2] || '').toLowerCase();
+    var ACTIONS = ['2', '3', 'ft', 'oreb', 'dreb', 'ast', 'stl', 'blk', 'tov', 'to',
+      'pf', 'chg', 'dfl', 'pfd'];
+    if (ACTIONS.indexOf(action) === -1) {
+      // Livestat treats an unknown 3rd token as a name assignment.
+      return { meta: { kind: 'name', team: team, num: num, name: tokens.slice(2).join(' ') } };
+    }
+
+    if (action === '2' || action === '3' || action === 'ft') {
+      var outcome = (tokens[3] || '').toLowerCase();
+      if (!isMake(outcome) && !isMiss(outcome)) {
+        return { error: 'Invalid outcome: ' + raw };
+      }
+      var ev = {
+        type: 'shot', team: team, num: num,
+        shot: action === 'ft' ? 1 : parseInt(action, 10),
+        made: isMake(outcome), secondChance: null
+      };
+      var rest = tokens.slice(4);
+      for (var i = 0; i < rest.length; i++) {
+        var tk = rest[i].toLowerCase();
+        if (tk === 'ast' && rest[i + 1]) { ev.astBy = rest[i + 1]; i++; }
+        else if (tk === 'f') ev.fastbreak = true;
+        else if (tk === 's') ev.secondChance = true;
+        else if (tk === 'ns') ev.secondChance = false;
+        else if (tk.charAt(0) === '@') {
+          var xy = tk.slice(1).split(',');
+          ev.loc = { x: parseFloat(xy[0]), y: parseFloat(xy[1]) };
+        }
+      }
+      return withClk(ev);
+    }
+
+    if (action === 'oreb') return withClk({ type: 'reb', team: team, num: num, kind: 'o' });
+    if (action === 'dreb') return withClk({ type: 'reb', team: team, num: num, kind: 'd' });
+    if (action === 'to') return withClk({ type: 'tov', team: team, num: num });
+    if (action === 'stl') {
+      var sev = { type: 'stl', team: team, num: num };
+      if ((tokens[3] || '').toLowerCase() === 'on' && tokens[4]) sev.onNum = tokens[4];
+      return withClk(sev);
+    }
+    if (action === 'blk') {
+      var bev = { type: 'blk', team: team, num: num };
+      if ((tokens[3] || '').toLowerCase() === 'on' && tokens[4]) {
+        bev.onNum = tokens[4];
+        bev.onShot = parseInt(tokens[5], 10) || 2;
+      }
+      return withClk(bev);
+    }
+    return withClk({ type: action, team: team, num: num });
+  }
+
+  /**
+   * Build {setup, events} from a full legacy Log column — powers the parity
+   * harness and api_loadGame disaster recovery.
+   */
+  function fromLegacyLog(lines, defaults) {
+    var teams = {}; var order = [];
+    var events = [];
+    function team(code) {
+      if (!teams[code]) {
+        teams[code] = { code: code, name: code.toUpperCase(), roster: [], starters: [] };
+        order.push(code);
+      }
+      return teams[code];
+    }
+    for (var i = 0; i < lines.length; i++) {
+      var res = parseCommand(lines[i]);
+      if (res.skip || res.error) continue;
+      if (res.meta) {
+        var m = res.meta;
+        if (m.kind === 'aka') team(m.team).name = m.name;
+        else if (m.kind === 'starters') team(m.team).starters = m.nums.map(String);
+        else if (m.kind === 'name') {
+          var t = team(m.team);
+          var found = false;
+          for (var j = 0; j < t.roster.length; j++) {
+            if (String(t.roster[j].num) === String(m.num)) { t.roster[j].name = m.name; found = true; }
+          }
+          if (!found) t.roster.push({ num: m.num, name: m.name });
+        }
+        continue;
+      }
+      var ev = res.event;
+      if (ev.team) team(ev.team);
+      if (ev.num != null) {
+        var t2 = team(ev.team);
+        var have = t2.roster.some(function (p) { return String(p.num) === String(ev.num); });
+        if (!have) t2.roster.push({ num: ev.num, name: '' });
+      }
+      events.push(ev);
+    }
+    var setup = {
+      teams: order.map(function (c) { return teams[c]; }),
+      tabName: (defaults && defaults.tabName) || 'Game',
+      quarterMinutes: (defaults && defaults.quarterMinutes) || 8
+    };
+    return { setup: setup, events: events };
+  }
+
+  // Human label for the ticker / event log screen.
+  function eventLabel(ev, state) {
+    function who() {
+      var name = ((state && state.playerNames[ev.team]) || {})[String(ev.num)] || '';
+      var short = name ? name.split(' ')[0] : '';
+      return '#' + ev.num + (short ? ' ' + short : '');
+    }
+    switch (ev.type) {
+      case 'shot': {
+        var kind = ev.shot === 1 ? 'FT' : ev.shot + 'PT';
+        var s = who() + ' ' + kind + (ev.made ? ' ✓' : ' ✗');
+        if (ev.made && ev.astBy != null && ev.shot !== 1) s += ' (ast ' + ev.astBy + ')';
+        if (ev.fastbreak) s += ' FB';
+        return s;
+      }
+      case 'reb': return who() + (ev.kind === 'o' ? ' OREB' : ' DREB');
+      case 'ast': return who() + ' AST';
+      case 'stl': return who() + ' STL' + (ev.onNum != null ? ' (from #' + ev.onNum + ')' : '');
+      case 'blk': return who() + ' BLK' + (ev.onNum != null ? ' (on #' + ev.onNum + ')' : '');
+      case 'tov': return who() + ' TOV';
+      case 'pf': return who() + ' FOUL';
+      case 'chg': return who() + ' CHARGE';
+      case 'dfl': return who() + ' DEFLECT';
+      case 'pfd': return who() + ' FOUL DRAWN';
+      case 'sub': return 'SUB: #' + ev.inNum + ' in, #' + ev.outNum + ' out';
+      case 'play': return '▶ PLAY: ' + (ev.name || '');
+      case 'quarterEnd': return '— end of period —';
+      case 'comment': return '# ' + (ev.text || '');
+      default: return ev.type;
+    }
+  }
+
+  return {
+    STAT_KEYS: STAT_KEYS,
+    emptyStats: emptyStats,
+    newState: newState,
+    applyEvent: applyEvent,
+    reduce: reduce,
+    teamTotals: teamTotals,
+    pct: pct,
+    playSummary: playSummary,
+    quarterLabel: quarterLabel,
+    toCommandString: toCommandString,
+    setupCommands: setupCommands,
+    parseCommand: parseCommand,
+    fromLegacyLog: fromLegacyLog,
+    eventLabel: eventLabel
+  };
+})();
+if (typeof module !== 'undefined' && module.exports) module.exports = Engine;
+</script>

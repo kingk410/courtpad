@@ -1,0 +1,835 @@
+<script>
+/**
+ * App — screens, tap handling, and game-state management.
+ *
+ * Flow model is player-first: tap a player, then an action. Contextual
+ * follow-up strips (assist? rebound? stolen from? blocked whom?) appear after
+ * the relevant events and are always optional — any other tap dismisses them.
+ * Every mutation: events change -> revision++ -> saveLocal -> Sync.bump ->
+ * full re-render from Engine.reduce (a few hundred events replay in ~ms).
+ */
+var App = (function () {
+  'use strict';
+
+  var game = null;        // {gameId, rec, setup, events, revision, trackShots}
+  var state = null;       // Engine.reduce output
+  var redoStack = [];
+  var sel = null;         // {team, num}
+  var selTimer = null;
+  var fbArmed = false;
+  var secondMode = 'auto'; // 'auto' | 's' | 'ns'
+  var followUp = null;    // {kind, ...}
+  var subMode = null;     // {team, stage:'out'|'in', outNum?}
+  var pendingShot = null; // shot event awaiting court location
+  var uid = function () { return Math.random().toString(36).slice(2, 10); };
+
+  function $(id) { return document.getElementById(id); }
+  function show(screenId) {
+    var screens = document.querySelectorAll('.screen');
+    for (var i = 0; i < screens.length; i++) screens[i].classList.remove('active');
+    $(screenId).classList.add('active');
+  }
+
+  // ---------------- persistence & sync glue ----------------
+
+  function buildPayload() {
+    if (!game || !game.rec) return null;
+    return {
+      gameId: game.gameId,
+      revision: game.revision,
+      commands: Engine.setupCommands(game.setup)
+        .concat(game.events.map(Engine.toCommandString)),
+      snapshot: buildSnapshot()
+    };
+  }
+
+  function buildSnapshot() {
+    var s = state;
+    var setup = game.setup;
+    var teams = setup.teams.map(function (t) {
+      var rows = Object.keys(s.players[t.code])
+        .sort(function (a, b) { return Number(a) - Number(b); })
+        .map(function (num) {
+          return {
+            num: num,
+            name: s.playerNames[t.code][num] || '',
+            stats: s.players[t.code][num],
+            min: (s.minutes[t.code] || {})[num] || 0,
+            pm: (s.plusMinus[t.code] || {})[num] || 0
+          };
+        });
+      return { code: t.code, rows: rows, totals: Engine.teamTotals(s, t.code) };
+    });
+    var fouls = {};
+    setup.teams.forEach(function (t) {
+      fouls[t.code] = teams[setup.teams.indexOf(t)].rows
+        .filter(function (r) { return r.stats.PF > 0; })
+        .sort(function (a, b) { return b.stats.PF - a.stats.PF; })
+        .map(function (r) { return { num: r.num, name: r.name, pf: r.stats.PF }; });
+    });
+    return {
+      quarterLabel: Engine.quarterLabel(s.quarter),
+      score: s.score,
+      teams: teams,
+      adv: s.adv,
+      quarters: s.quarterStats,
+      maxQuarter: s.maxQuarter,
+      fouls: fouls,
+      series: s.series,
+      quarterMarks: s.quarterMarks,
+      shots: s.shots,
+      playStats: Engine.playSummary(s)
+    };
+  }
+
+  function mutate(fn) {
+    fn();
+    game.revision++;
+    state = Engine.reduce(game.setup, game.events, { clk: clockElapsedSec() });
+    Sync.saveLocal(game);
+    Sync.bump();
+    render();
+  }
+
+  function pushEvent(ev) {
+    ev.id = uid();
+    ev.seq = game.events.length;
+    ev.ts = Date.now();
+    ev.clk = clockElapsedSec();
+    redoStack = [];
+    mutate(function () { game.events.push(ev); });
+    return ev;
+  }
+
+  // ---------------- play list (team playbook) ----------------
+  // Stored locally and in ScriptProperties so it follows the account. Play
+  // *stats* live in the events; this list only drives which chips render.
+
+  var playList = [];
+
+  function loadPlays() {
+    try { playList = JSON.parse(Sync.getPref('plays', '[]')) || []; } catch (e) { playList = []; }
+    Sync.call('api_getPlays').then(function (server) {
+      if (server && server.length) { playList = server; Sync.setPref('plays', JSON.stringify(server)); }
+      if (game) render();
+    }).catch(function () { /* offline — local copy stands */ });
+  }
+
+  function savePlays(list) {
+    playList = list;
+    Sync.setPref('plays', JSON.stringify(list));
+    Sync.call('api_savePlays', list).catch(function () { /* retried on next save */ });
+    if (game) render();
+  }
+
+  function renderPlays() {
+    var el = $('g-plays');
+    // Include plays that appear in this game's events even if since removed.
+    var names = playList.slice();
+    (state.playOrder || []).forEach(function (n) {
+      if (names.indexOf(n) === -1) names.push(n);
+    });
+    if (!names.length) { el.style.display = 'none'; return; }
+    el.style.display = '';
+    var active = state.playWindow && state.playWindow.name;
+    el.innerHTML = names.map(function (name, i) {
+      var on = active === name;
+      return '<button class="chip' + (on ? ' on' : '') + '" data-play="' +
+        esc(name) + '"' + (on ? ' disabled' : '') + '>' + esc(name) +
+        (on ? ' ●' : '') + '</button>';
+    }).join('');
+  }
+
+  function playStatsHtml() {
+    var rows = Engine.playSummary(state);
+    if (!rows.length) return '';
+    var html = '<div style="padding:10px 12px; border-bottom:2px solid var(--line)">' +
+      '<div class="muted" style="margin-bottom:6px">PLAY STATS (this game)</div>' +
+      '<table style="width:100%; border-collapse:collapse; font-size:14px">' +
+      '<tr style="color:var(--dim); text-align:right">' +
+      '<th style="text-align:left; padding:3px 6px">Play</th><th>Calls</th><th>PTS</th>' +
+      '<th>PPP</th><th>TOV</th><th>Score%</th></tr>';
+    rows.forEach(function (r) {
+      html += '<tr style="text-align:right"><td style="text-align:left; padding:3px 6px">' +
+        esc(r.name) + '</td><td>' + r.calls + '</td><td>' + r.points + '</td><td>' +
+        r.ppp.toFixed(2) + '</td><td>' + r.tovs + '</td><td>' +
+        Math.round(r.scoreRate * 100) + '%</td></tr>';
+    });
+    return html + '</table></div>';
+  }
+
+  // ---------------- game clock (play/pause) ----------------
+  // Elapsed seconds within the current quarter. Every event gets stamped with
+  // the reading; completed quarters are rescaled to true length by the engine,
+  // so imperfect pausing self-corrects at each quarter boundary. If the clock
+  // is never used, minutes fall back to the event-pace estimate.
+
+  function clockState() {
+    if (!game.clock) game.clock = { running: false, elapsedMs: 0, startedAt: null };
+    return game.clock;
+  }
+
+  function clockElapsedSec() {
+    if (!game) return 0;
+    var c = clockState();
+    var ms = c.elapsedMs + (c.running ? Date.now() - c.startedAt : 0);
+    return Math.max(0, Math.round(ms / 1000));
+  }
+
+  function toggleClock() {
+    var c = clockState();
+    if (c.running) {
+      c.elapsedMs += Date.now() - c.startedAt;
+      c.startedAt = null;
+      c.running = false;
+    } else {
+      c.startedAt = Date.now();
+      c.running = true;
+    }
+    Sync.saveLocal(game);
+    renderClock();
+  }
+
+  function resetClock() {
+    game.clock = { running: false, elapsedMs: 0, startedAt: null };
+    Sync.saveLocal(game);
+    renderClock();
+  }
+
+  function renderClock() {
+    var el = $('g-clock');
+    if (!el || !game) return;
+    var c = clockState();
+    var qm = (game.setup.quarterMinutes || 8) * 60;
+    var remaining = Math.max(0, qm - clockElapsedSec());
+    var mm = Math.floor(remaining / 60);
+    var ss = ('0' + (remaining % 60)).slice(-2);
+    el.textContent = (c.running ? '⏸ ' : '▶ ') + mm + ':' + ss;
+    el.style.color = c.running ? 'var(--green)' : (clockElapsedSec() > 0 ? 'var(--amber)' : '');
+  }
+
+  function amendEvent(id, patch) {
+    mutate(function () {
+      for (var i = game.events.length - 1; i >= 0; i--) {
+        if (game.events[i].id === id) {
+          for (var k in patch) game.events[i][k] = patch[k];
+          return;
+        }
+      }
+    });
+  }
+
+  function deleteEvent(id) {
+    mutate(function () {
+      game.events = game.events.filter(function (e) { return e.id !== id; });
+    });
+  }
+
+  // ---------------- game screen rendering ----------------
+
+  function teamOf(idx) { return game.setup.teams[idx]; }
+
+  function render() {
+    if (!game) return;
+    var tA = teamOf(0), tB = teamOf(1);
+    $('g-nameA').textContent = tA.name.toUpperCase();
+    $('g-nameB').textContent = tB.name.toUpperCase();
+    $('g-colnameA').textContent = tA.name;
+    $('g-colnameB').textContent = tB.name;
+    $('g-ptsA').textContent = state.score[tA.code];
+    $('g-ptsB').textContent = state.score[tB.code];
+    $('g-qchip').textContent = Engine.quarterLabel(state.quarter);
+
+    renderPlayers('g-playersA', tA, 'A');
+    renderPlayers('g-playersB', tB, 'B');
+
+    // Selection line / sub prompt
+    var line = 'Tap a player';
+    if (subMode) {
+      line = subMode.stage === 'out'
+        ? 'SUB (' + teamName(subMode.team) + '): tap player going OUT'
+        : 'SUB: tap player coming IN for #' + subMode.outNum;
+    } else if (sel) {
+      var nm = state.playerNames[sel.team][sel.num] || '';
+      line = '<b>#' + sel.num + ' ' + nm + '</b> — pick an action';
+    }
+    $('g-selline').innerHTML = line;
+
+    // Action buttons enabled only with a selection (and not in sub mode)
+    var abtns = document.querySelectorAll('.abtn');
+    for (var i = 0; i < abtns.length; i++) abtns[i].disabled = !sel || !!subMode;
+
+    $('g-fb').className = 'tbtn' + (fbArmed ? ' on' : '');
+    var secondLabels = { auto: '2nd chance: auto', s: '2nd chance: FORCE', ns: '2nd chance: OFF' };
+    $('g-2nd').textContent = secondLabels[secondMode];
+    $('g-2nd').className = 'tbtn' + (secondMode !== 'auto' ? ' on' : '');
+    $('g-subA').className = 'subbtn' + (subMode && subMode.team === tA.code ? ' arming' : '');
+    $('g-subB').className = 'subbtn' + (subMode && subMode.team === tB.code ? ' arming' : '');
+
+    renderFollowUp();
+    renderPlays();
+
+    var last = game.events.slice(-3).reverse().map(function (e) {
+      return Engine.eventLabel(e, state);
+    });
+    $('g-ticker').innerHTML = last.length
+      ? '<b>' + last[0] + '</b>' + (last[1] ? ' · ' + last.slice(1).join(' · ') : '')
+      : 'No events yet';
+    renderClock();
+  }
+
+  function teamName(code) {
+    var t = game.setup.teams.filter(function (t) { return t.code === code; })[0];
+    return t ? t.name : code;
+  }
+
+  function renderPlayers(elId, team, side) {
+    var el = $(elId);
+    var on = state.onCourt[team.code] || [];
+    var roster = team.roster.map(function (p) { return String(p.num); });
+    var bench = roster.filter(function (n) { return on.indexOf(n) === -1; })
+      .sort(function (a, b) { return Number(a) - Number(b); });
+    var html = '';
+    var groups = on.length ? [on.slice().sort(function (a, b) { return Number(a) - Number(b); }), bench]
+      : [roster.sort(function (a, b) { return Number(a) - Number(b); }), []];
+    groups.forEach(function (group, gi) {
+      if (gi === 1 && group.length) html += '<div class="benchlabel">— bench —</div>';
+      group.forEach(function (num) {
+        var pf = (state.players[team.code][num] || {}).PF || 0;
+        var name = state.playerNames[team.code][num] || '';
+        var cls = 'pbtn';
+        if (sel && sel.team === team.code && sel.num === num) cls += ' selected';
+        if (subMode && subMode.team === team.code) {
+          var targetGroup = subMode.stage === 'out' ? 0 : 1;
+          if (gi === targetGroup) cls += ' subtarget';
+        }
+        var foulCls = pf >= 4 ? 'fouls danger' : pf >= 3 ? 'fouls warn' : 'fouls';
+        html += '<button class="' + cls + '" data-team="' + team.code + '" data-num="' + num + '">' +
+          '<span class="num">' + num + '</span>' +
+          '<span class="pname">' + esc(shortName(name)) + '</span>' +
+          '<span class="' + foulCls + '">' + '●'.repeat(Math.min(pf, 5)) + '</span></button>';
+      });
+    });
+    el.innerHTML = html;
+  }
+
+  function shortName(name) {
+    if (!name) return '';
+    var parts = name.split(' ');
+    return parts.length > 1 ? parts[0] + ' ' + parts[parts.length - 1].charAt(0) + '.' : name;
+  }
+
+  function esc(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  // ---------------- selection & actions ----------------
+
+  function tapPlayer(teamCode, num) {
+    if (subMode && subMode.team === teamCode) {
+      if (subMode.stage === 'out') {
+        subMode = { team: teamCode, stage: 'in', outNum: num };
+      } else {
+        if (num !== subMode.outNum) {
+          pushEvent({ type: 'sub', team: teamCode, inNum: num, outNum: subMode.outNum });
+          toast('SUB: #' + num + ' in, #' + subMode.outNum + ' out');
+        }
+        subMode = null;
+      }
+      render();
+      return;
+    }
+    dismissFollowUp();
+    sel = { team: teamCode, num: num };
+    resetSelTimer();
+    render();
+  }
+
+  function resetSelTimer() {
+    if (selTimer) clearTimeout(selTimer);
+    selTimer = setTimeout(function () { sel = null; render(); }, 8000);
+  }
+
+  function tapAction(act) {
+    if (!sel) return;
+    resetSelTimer();
+    var team = sel.team, num = sel.num;
+    var shotActs = { '2make': [2, true], '2miss': [2, false], '3make': [3, true],
+      '3miss': [3, false], 'ftmake': [1, true], 'ftmiss': [1, false] };
+
+    if (shotActs[act]) {
+      var shot = shotActs[act][0], made = shotActs[act][1];
+      var ev = { type: 'shot', team: team, num: num, shot: shot, made: made };
+      if (fbArmed && made) ev.fastbreak = true;
+      if (secondMode === 's') ev.secondChance = true;
+      if (secondMode === 'ns') ev.secondChance = false;
+      fbArmed = false;
+      secondMode = 'auto';
+      if (shot !== 1 && game.trackShots) {
+        pendingShot = ev;
+        openCourtModal(ev);
+      } else {
+        finishShot(ev);
+      }
+      return;
+    }
+
+    dismissFollowUp();
+    switch (act) {
+      case 'oreb': pushEvent({ type: 'reb', team: team, num: num, kind: 'o' }); break;
+      case 'dreb': pushEvent({ type: 'reb', team: team, num: num, kind: 'd' }); break;
+      case 'ast': pushEvent({ type: 'ast', team: team, num: num }); break;
+      case 'tov': pushEvent({ type: 'tov', team: team, num: num }); break;
+      case 'pf': pushEvent({ type: 'pf', team: team, num: num }); break;
+      case 'chg': pushEvent({ type: 'chg', team: team, num: num }); break;
+      case 'dfl': pushEvent({ type: 'dfl', team: team, num: num }); break;
+      case 'pfd': pushEvent({ type: 'pfd', team: team, num: num }); break;
+      case 'stl': {
+        var sev = pushEvent({ type: 'stl', team: team, num: num });
+        followUp = { kind: 'stealFrom', eventId: sev.id, team: team };
+        render();
+        break;
+      }
+      case 'blk': {
+        var bev = pushEvent({ type: 'blk', team: team, num: num });
+        followUp = { kind: 'blockOn', eventId: bev.id, team: team, stage: 1 };
+        render();
+        break;
+      }
+    }
+  }
+
+  function finishShot(ev) {
+    pushEvent(ev);
+    if (ev.made && ev.shot !== 1) {
+      followUp = { kind: 'assist', eventId: ev.id, team: ev.team, scorer: ev.num };
+    } else if (!ev.made) {
+      followUp = { kind: 'rebound', shooterTeam: ev.team };
+    }
+    render();
+  }
+
+  // ---------------- follow-up strips ----------------
+
+  function dismissFollowUp() {
+    if (followUp) { followUp = null; }
+  }
+
+  function renderFollowUp() {
+    var box = $('g-followup');
+    if (!followUp) { box.className = 'followup'; return; }
+    box.className = 'followup visible';
+    var q = '', opts = [];
+    var fu = followUp;
+
+    function playerBtns(teamCode, exclude, tag) {
+      var on = state.onCourt[teamCode] || [];
+      var roster = Object.keys(state.players[teamCode]);
+      var order = (on.length ? on.concat(roster.filter(function (n) { return on.indexOf(n) === -1; }))
+        : roster).filter(function (n, i, a) { return a.indexOf(n) === i; });
+      return order
+        .filter(function (n) { return n !== exclude; })
+        .map(function (n) {
+          return { label: '#' + n, team: teamCode, num: n, tag: tag };
+        });
+    }
+
+    if (fu.kind === 'assist') {
+      q = 'Assist?';
+      opts = playerBtns(fu.team, fu.scorer, 'assist');
+      opts.push({ label: 'No assist', dismiss: true });
+    } else if (fu.kind === 'rebound') {
+      q = 'Rebound?';
+      var other = otherCode(fu.shooterTeam);
+      opts = playerBtns(fu.shooterTeam, null, 'oreb')
+        .map(function (o) { o.label = teamName(fu.shooterTeam).slice(0, 1) + ' ' + o.label; return o; })
+        .concat(playerBtns(other, null, 'dreb').map(function (o) {
+          o.label = teamName(other).slice(0, 1) + ' ' + o.label; return o;
+        }));
+      opts.push({ label: 'Skip', dismiss: true });
+    } else if (fu.kind === 'stealFrom') {
+      q = 'Stolen from? (charges a turnover)';
+      opts = playerBtns(otherCode(fu.team), null, 'stealFrom');
+      opts.push({ label: 'Skip', dismiss: true });
+    } else if (fu.kind === 'blockOn') {
+      if (fu.stage === 1) {
+        q = 'Blocked whose shot? (charges a miss)';
+        opts = playerBtns(otherCode(fu.team), null, 'blockOn');
+        opts.push({ label: 'Skip', dismiss: true });
+      } else {
+        q = 'Blocked shot was a…';
+        opts = [{ label: '2PT', tag: 'blockShot', shot: 2 },
+          { label: '3PT', tag: 'blockShot', shot: 3 }];
+      }
+    }
+
+    $('g-fq').textContent = q;
+    var html = '';
+    opts.forEach(function (o, i) {
+      html += '<button class="fbtn' + (o.dismiss ? ' dismiss' : '') + '" data-fi="' + i + '">' +
+        esc(o.label) + '</button>';
+    });
+    $('g-fopts').innerHTML = html;
+    box._opts = opts;
+  }
+
+  function tapFollowUp(idx) {
+    var opts = $('g-followup')._opts || [];
+    var o = opts[idx];
+    if (!o) return;
+    var fu = followUp;
+    if (o.dismiss) { followUp = null; render(); return; }
+
+    if (o.tag === 'assist') {
+      followUp = null;
+      amendEvent(fu.eventId, { astBy: o.num });
+    } else if (o.tag === 'oreb' || o.tag === 'dreb') {
+      followUp = null;
+      pushEvent({ type: 'reb', team: o.team, num: o.num, kind: o.tag === 'oreb' ? 'o' : 'd' });
+    } else if (o.tag === 'stealFrom') {
+      followUp = null;
+      amendEvent(fu.eventId, { onNum: o.num });
+    } else if (o.tag === 'blockOn') {
+      followUp = { kind: 'blockOn', eventId: fu.eventId, team: fu.team, stage: 2, onNum: o.num };
+      render();
+    } else if (o.tag === 'blockShot') {
+      followUp = null;
+      amendEvent(fu.eventId, { onNum: fu.onNum, onShot: o.shot });
+    }
+  }
+
+  function otherCode(code) {
+    var t = game.setup.teams;
+    return t[0].code === code ? t[1].code : t[0].code;
+  }
+
+  // ---------------- court modal ----------------
+
+  function openCourtModal(ev) {
+    $('court-title').textContent = 'Where was the ' + (ev.shot === 3 ? '3' : '2') +
+      'PT ' + (ev.made ? 'make' : 'miss') + '? (#' + ev.num + ')';
+    $('modal-court').classList.add('visible');
+  }
+
+  function closeCourtModal() { $('modal-court').classList.remove('visible'); }
+
+  function courtTapped(evTap) {
+    if (!pendingShot) return;
+    var svg = $('court-svg');
+    var rect = svg.getBoundingClientRect();
+    var x = (evTap.clientX - rect.left) / rect.width * 50;
+    var y = (evTap.clientY - rect.top) / rect.height * 47;
+    pendingShot.loc = { x: Math.round(x * 10) / 10, y: Math.round(y * 10) / 10 };
+    var ev = pendingShot;
+    pendingShot = null;
+    closeCourtModal();
+    finishShot(ev);
+  }
+
+  function courtSkipped() {
+    var ev = pendingShot;
+    pendingShot = null;
+    closeCourtModal();
+    if (ev) finishShot(ev);
+  }
+
+  // ---------------- undo / redo ----------------
+
+  function undo() {
+    if (!game.events.length) return;
+    var ev;
+    mutate(function () { ev = game.events.pop(); });
+    redoStack.push(ev);
+    toast('Undid: ' + Engine.eventLabel(ev, state), 'Redo', function () {
+      var back = redoStack.pop();
+      if (back) mutate(function () { game.events.push(back); });
+    });
+  }
+
+  var toastTimer = null;
+  function toast(text, actionLabel, onAction) {
+    $('toast-text').textContent = text;
+    var btn = $('toast-action');
+    if (actionLabel) {
+      btn.style.display = '';
+      btn.textContent = actionLabel;
+      btn.onclick = function () { hideToast(); onAction(); };
+    } else {
+      btn.style.display = 'none';
+    }
+    $('toast').classList.add('visible');
+    if (toastTimer) clearTimeout(toastTimer);
+    toastTimer = setTimeout(hideToast, 3500);
+  }
+  function hideToast() { $('toast').classList.remove('visible'); }
+
+  // ---------------- confirm modal ----------------
+
+  var confirmYes = null;
+  function ask(text, onYes) {
+    $('confirm-text').textContent = text;
+    confirmYes = onYes;
+    $('modal-confirm').classList.add('visible');
+  }
+
+  // ---------------- event log screen ----------------
+
+  function openLog() {
+    var rows = game.events.map(function (e, i) { return { e: e, i: i }; }).reverse();
+    var html = '';
+    rows.forEach(function (r) {
+      var teamLabel = r.e.team ? teamName(r.e.team) : '';
+      html += '<div class="logrow">' +
+        '<span class="lq">' + eventQuarterLabel(r.i) + '</span>' +
+        '<span class="ltext">' + esc(teamLabel ? teamLabel + ': ' : '') +
+        esc(Engine.eventLabel(r.e, state)) + '</span>' +
+        '<button class="del" data-id="' + r.e.id + '">Delete</button></div>';
+    });
+    $('log-list').innerHTML = html || '<div class="muted" style="padding:20px">No events.</div>';
+    $('log-playstats').innerHTML = playStatsHtml();
+    $('log-count').textContent = game.events.length + ' events';
+    show('screen-log');
+  }
+
+  function eventQuarterLabel(index) {
+    var q = 1;
+    for (var i = 0; i < index; i++) if (game.events[i].type === 'quarterEnd') q++;
+    return Engine.quarterLabel(q);
+  }
+
+  // ---------------- home screen ----------------
+
+  function initHome() {
+    var currentId = Sync.currentGameId();
+    var local = currentId ? Sync.loadLocal(currentId) : null;
+    $('home-resume').style.display = local ? '' : 'none';
+    if (local) {
+      $('home-resume').textContent = 'Resume: ' + (local.rec ? local.rec.tabName : 'game');
+      $('home-resume').onclick = function () { loadGameObject(local); };
+    }
+    listGames();
+    show('screen-home');
+  }
+
+  function listGames() {
+    $('home-games').innerHTML = '<div class="muted">Loading…</div>';
+    Sync.call('api_listGames').then(function (games) {
+      if (!games.length) {
+        $('home-games').innerHTML = '<div class="muted">No games yet.</div>';
+        return;
+      }
+      var html = '';
+      games.forEach(function (g, i) {
+        html += '<div class="gamerow"><div>' + esc(g.tabName) +
+          '<div class="muted">' + (g.createdAt || '').slice(0, 10) + '</div></div>' +
+          '<button class="topbtn" data-gi="' + i + '">Open</button></div>';
+      });
+      $('home-games').innerHTML = html;
+      var btns = $('home-games').querySelectorAll('button');
+      for (var i = 0; i < btns.length; i++) {
+        btns[i].onclick = function () { openRemoteGame(games[Number(this.dataset.gi)]); };
+      }
+    }).catch(function (err) {
+      $('home-games').innerHTML = '<div class="muted">Could not load games: ' + esc(err) + '</div>';
+    });
+  }
+
+  function openRemoteGame(summary) {
+    var local = Sync.loadLocal(summary.gameId);
+    if (local) { loadGameObject(local); return; }
+    $('home-games').innerHTML = '<div class="muted">Loading game…</div>';
+    Sync.call('api_loadGame', summary.gameId).then(function (res) {
+      var parsed = Engine.fromLegacyLog(res.commands, { tabName: res.record.tabName });
+      // Server setup is authoritative (it has names/starters even if log lacks them)
+      var g = {
+        gameId: res.record.gameId,
+        rec: res.record,
+        setup: res.record.setup,
+        events: parsed.events,
+        revision: res.record.appliedRevision,
+        trackShots: true
+      };
+      loadGameObject(g);
+    }).catch(function (err) {
+      toast('Load failed: ' + err);
+      initHome();
+    });
+  }
+
+  function loadGameObject(g) {
+    game = g;
+    if (!game.clock) game.clock = { running: false, elapsedMs: 0, startedAt: null };
+    redoStack = [];
+    sel = null; followUp = null; subMode = null; fbArmed = false; secondMode = 'auto';
+    state = Engine.reduce(game.setup, game.events, { clk: clockElapsedSec() });
+    Sync.saveLocal(game);
+    show('screen-game');
+    render();
+    renderClock();
+  }
+
+  // ---------------- menu / reports ----------------
+
+  function generateReport(type) {
+    $('m-status').textContent = 'Syncing + generating ' + type.toLowerCase() + ' report…';
+    Sync.flushNow().then(function () {
+      return Sync.call('api_generateReport', game.gameId, type, { snapshot: buildSnapshot() });
+    }).then(function (res) {
+      $('m-status').innerHTML = 'Report ready: <a href="' + res.url +
+        '" target="_blank" style="color:var(--accent)">' + esc(res.name) + '</a>' +
+        ' — open it and print (Cmd/Ctrl+P).';
+    }).catch(function (err) {
+      $('m-status').textContent = 'Report failed: ' + err;
+    });
+  }
+
+  // ---------------- wiring ----------------
+
+  function init() {
+    Sync.init(typeof TOKEN !== 'undefined' ? TOKEN : '', buildPayload, function (status) {
+      var dot = $('g-syncdot');
+      if (dot) dot.className = 'syncdot ' + status;
+    });
+
+    // Home
+    $('home-new').onclick = function () { SetupUI.open(); };
+    $('home-plays').onclick = function () {
+      $('plays-text').value = playList.join('\n');
+      $('modal-plays').classList.add('visible');
+    };
+    $('plays-close').onclick = function () { $('modal-plays').classList.remove('visible'); };
+    $('plays-save').onclick = function () {
+      var list = $('plays-text').value.split('\n')
+        .map(function (l) { return l.trim(); })
+        .filter(function (l, i, a) { return l && a.indexOf(l) === i; });
+      savePlays(list);
+      $('modal-plays').classList.remove('visible');
+      toast('Saved ' + list.length + ' plays');
+    };
+
+    // In-game play chips: tap = "we're running this play" for my team.
+    $('g-plays').addEventListener('click', function (e) {
+      var chip = e.target.closest('.chip');
+      if (!chip || chip.disabled) return;
+      dismissFollowUp();
+      pushEvent({ type: 'play', team: teamOf(0).code, name: chip.dataset.play });
+    });
+
+    // Setup
+    $('setup-back').onclick = initHome;
+    $('setup-create').onclick = function () { SetupUI.create(loadGameObject); };
+
+    // Game: player buttons (delegated)
+    ['g-playersA', 'g-playersB'].forEach(function (id) {
+      $(id).addEventListener('click', function (e) {
+        var btn = e.target.closest('.pbtn');
+        if (btn) tapPlayer(btn.dataset.team, btn.dataset.num);
+      });
+    });
+    // Action buttons
+    var abtns = document.querySelectorAll('.abtn');
+    for (var i = 0; i < abtns.length; i++) {
+      abtns[i].addEventListener('click', function () { tapAction(this.dataset.act); });
+    }
+    // Toggles
+    $('g-fb').onclick = function () { fbArmed = !fbArmed; render(); };
+    $('g-2nd').onclick = function () {
+      secondMode = secondMode === 'auto' ? 's' : secondMode === 's' ? 'ns' : 'auto';
+      render();
+    };
+    // Subs
+    $('g-subA').onclick = function () { toggleSub(teamOf(0).code); };
+    $('g-subB').onclick = function () { toggleSub(teamOf(1).code); };
+    function toggleSub(code) {
+      subMode = (subMode && subMode.team === code) ? null : { team: code, stage: 'out' };
+      sel = null;
+      render();
+    }
+    // Follow-up strip (delegated)
+    $('g-fopts').addEventListener('click', function (e) {
+      var btn = e.target.closest('.fbtn');
+      if (btn) tapFollowUp(Number(btn.dataset.fi));
+    });
+    // Quarter, undo, menu, log
+    $('g-qchip').onclick = function () {
+      var label = Engine.quarterLabel(state.quarter);
+      ask('End ' + label + '?', function () {
+        pushEvent({ type: 'quarterEnd' }); // stamped with the final clock reading
+        resetClock();                       // next quarter starts fresh at 8:00
+      });
+    };
+    $('g-clock').onclick = toggleClock;
+    setInterval(function () {
+      if (game && $('screen-game').classList.contains('active')) renderClock();
+    }, 1000);
+    $('g-undo').onclick = undo;
+    $('g-openlog').onclick = openLog;
+    $('log-back').onclick = function () { show('screen-game'); render(); };
+    $('log-list').addEventListener('click', function (e) {
+      var btn = e.target.closest('.del');
+      if (!btn) return;
+      var id = btn.dataset.id;
+      ask('Delete this event? All stats recompute.', function () {
+        deleteEvent(id);
+        openLog();
+      });
+    });
+    // Menu
+    $('g-menu').onclick = function () {
+      $('m-status').textContent = '';
+      $('modal-menu').classList.add('visible');
+    };
+    $('m-close').onclick = function () { $('modal-menu').classList.remove('visible'); };
+    $('m-sheet').onclick = function () {
+      if (game.rec && game.rec.ssUrl) window.open(game.rec.ssUrl, '_blank');
+    };
+    $('m-half').onclick = function () { generateReport('HALFTIME'); };
+    $('m-final').onclick = function () { generateReport('FINAL'); };
+    $('m-sync').onclick = function () {
+      $('m-status').textContent = 'Syncing…';
+      Sync.bump();
+      Sync.flushNow().then(function (ok) {
+        $('m-status').textContent = ok ? 'Synced.' : 'Sync failing — will keep retrying.';
+      });
+    };
+    $('m-home').onclick = function () {
+      $('modal-menu').classList.remove('visible');
+      initHome();
+    };
+    // Court modal
+    $('court-svg').addEventListener('click', courtTapped);
+    $('court-skip').onclick = courtSkipped;
+    // Confirm modal
+    $('confirm-yes').onclick = function () {
+      $('modal-confirm').classList.remove('visible');
+      if (confirmYes) confirmYes();
+    };
+    $('confirm-no').onclick = function () { $('modal-confirm').classList.remove('visible'); };
+
+    // Keep the screen awake during games (iPad Safari supports Wake Lock).
+    if (navigator.wakeLock && navigator.wakeLock.request) {
+      var acquire = function () {
+        navigator.wakeLock.request('screen').catch(function () { });
+      };
+      acquire();
+      document.addEventListener('visibilitychange', function () {
+        if (document.visibilityState === 'visible') acquire();
+      });
+    }
+
+    loadPlays();
+
+    // Resume directly into a live game if one exists.
+    var currentId = Sync.currentGameId();
+    var local = currentId ? Sync.loadLocal(currentId) : null;
+    if (local && local.events) loadGameObject(local);
+    else initHome();
+  }
+
+  return {
+    init: init,
+    getGame: function () { return game; },
+    getPlays: function () { return playList.slice(); }
+  };
+})();
+</script>
