@@ -114,7 +114,14 @@
   }
   .followup.visible { display: flex; }
   .followup .fq { font-size: 14px; font-weight: 700; }
-  .fopts { display: flex; flex-wrap: wrap; gap: 8px; }
+  .fopts { display: flex; flex-direction: column; gap: 8px; }
+  .fgroup { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .fglabel {
+    flex: 0 0 100%; font-size: 11px; font-weight: 700; letter-spacing: 1px;
+    text-transform: uppercase; color: var(--dim);
+  }
+  .fglabel.teamA { color: var(--teamA); }
+  .fglabel.teamB { color: var(--teamB); }
   .fbtn {
     min-height: 48px; min-width: 64px; padding: 0 12px; border-radius: 10px;
     font-size: 16px; font-weight: 700; background: var(--panel2); border: 1px solid var(--line);
@@ -168,6 +175,8 @@
     background: var(--accent); color: #fff;
   }
   .bigbtn.secondary { background: var(--panel2); border: 1px solid var(--line); color: var(--text); }
+  .bigbtn.danger, .topbtn.danger { color: var(--red); }
+  .rowbtns { display: flex; gap: 8px; flex: 0 0 auto; }
   .gamerow {
     display: flex; justify-content: space-between; align-items: center; gap: 8px;
     background: var(--panel2); border: 1px solid var(--line); border-radius: 10px;

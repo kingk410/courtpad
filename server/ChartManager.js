@@ -38,11 +38,27 @@ function createScoreChart_(ss, rec, gameSheet, geo) {
     .setOption('vAxis', { title: 'Score Differential' })
     .setOption('interpolateNulls', false)
     .setOption('series', seriesOpts)
-    .setPosition(geo.subStart, 17, 0, 0)
+    .setPosition(geo.chartRow, CHART_COL, 0, 0)
     .setOption('width', 640)
     .setOption('height', 400)
     .build();
   gameSheet.insertChart(chart);
+}
+
+/**
+ * Move the existing score chart to where the current layout wants it.
+ * With `dropOthers`, anything that isn't the line chart (the v1 shot
+ * scatter charts) is removed.
+ */
+function positionScoreChart_(sheet, geo, dropOthers) {
+  sheet.getCharts().forEach(function (ch) {
+    var isLine = true;
+    try { isLine = String(ch.modify().getChartType()) === 'LINE'; } catch (err) { }
+    if (!isLine) { if (dropOthers) sheet.removeChart(ch); return; }
+    var info = ch.getContainerInfo();
+    if (info.getAnchorRow() === geo.chartRow && info.getAnchorColumn() === CHART_COL) return;
+    sheet.updateChart(ch.modify().setPosition(geo.chartRow, CHART_COL, 0, 0).build());
+  });
 }
 
 function writeGraphData_(ss, rec, snap) {

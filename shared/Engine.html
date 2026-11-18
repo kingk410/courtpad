@@ -719,24 +719,33 @@ var Engine = (function () {
       var short = name ? name.split(' ')[0] : '';
       return '#' + ev.num + (short ? ' ' + short : '');
     }
+    // Secondary player reference (assister, sub, stolen-from...), named when known.
+    function ref(team, num) {
+      var name = ((state && state.playerNames[team]) || {})[String(num)] || '';
+      return '#' + num + (name ? ' ' + name.split(' ')[0] : '');
+    }
+    function opp() {
+      var codes = (state && state.teamCodes) || [];
+      return codes[0] === ev.team ? codes[1] : codes[0];
+    }
     switch (ev.type) {
       case 'shot': {
         var kind = ev.shot === 1 ? 'FT' : ev.shot + 'PT';
         var s = who() + ' ' + kind + (ev.made ? ' ✓' : ' ✗');
-        if (ev.made && ev.astBy != null && ev.shot !== 1) s += ' (ast ' + ev.astBy + ')';
+        if (ev.made && ev.astBy != null && ev.shot !== 1) s += ' (ast ' + ref(ev.team, ev.astBy) + ')';
         if (ev.fastbreak) s += ' FB';
         return s;
       }
       case 'reb': return who() + (ev.kind === 'o' ? ' OREB' : ' DREB');
       case 'ast': return who() + ' AST';
-      case 'stl': return who() + ' STL' + (ev.onNum != null ? ' (from #' + ev.onNum + ')' : '');
-      case 'blk': return who() + ' BLK' + (ev.onNum != null ? ' (on #' + ev.onNum + ')' : '');
+      case 'stl': return who() + ' STL' + (ev.onNum != null ? ' (from ' + ref(opp(), ev.onNum) + ')' : '');
+      case 'blk': return who() + ' BLK' + (ev.onNum != null ? ' (on ' + ref(opp(), ev.onNum) + ')' : '');
       case 'tov': return who() + ' TOV';
       case 'pf': return who() + ' FOUL';
       case 'chg': return who() + ' CHARGE';
       case 'dfl': return who() + ' DEFLECT';
       case 'pfd': return who() + ' FOUL DRAWN';
-      case 'sub': return 'SUB: #' + ev.inNum + ' in, #' + ev.outNum + ' out';
+      case 'sub': return 'SUB: ' + ref(ev.team, ev.inNum) + ' in, ' + ref(ev.team, ev.outNum) + ' out';
       case 'play': return '▶ PLAY: ' + (ev.name || '');
       case 'quarterEnd': return '— end of period —';
       case 'comment': return '# ' + (ev.text || '');

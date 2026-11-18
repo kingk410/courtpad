@@ -8,7 +8,7 @@ reports as Google Docs.
 
 - Script project: "CourtPad" (standalone), script ID in `.clasp.json`
 - The old Livestat project is untouched; CourtPad writes the same command
-  grammar into a `Log_<game>` tab, so every game stays auditable/replayable.
+  grammar into a hidden `Log_<game>` tab, so every game stays auditable/replayable.
 
 ## One-time setup (in a browser, ~1 minute)
 
@@ -33,7 +33,7 @@ Keep the tokened URL private: anyone who has it can enter stats.
   (off an OREB) with a force/off override. SUB buttons handle substitutions.
   Tap the court sketch to record shot locations, or Skip.
 - **Shot charts**: every game tab carries a shot heat map per team (to the
-  right of the score chart): a half-court grid of ~3 ft cells, basket at the
+  right of the box score): a half-court grid of ~3 ft cells, basket at the
   top, each cell showing made/attempts and colored by FG% (red = cold,
   green = hot, deeper with more attempts). Empty cells are tinted to draw the
   court: tan paint, cream mid-range, grey beyond the arc. A Paint /
@@ -53,6 +53,7 @@ Keep the tokened URL private: anyone who has it can enter stats.
   above the toggles: tap one when you call it, and the engine attributes that
   possession to it — points (including OREB put-backs and and-1 FTs),
   turnovers (incl. charges and opponent steals) — until the possession ends.
+  Tap the active play again to call it off (the call is removed entirely).
   Per-play Calls / PTS / PPP / TOV / Score% show live in the Log screen, in a
   PLAY STATS block on the sheet (games created after the playbook exists),
   and in printed reports.
@@ -60,6 +61,12 @@ Keep the tokened URL private: anyone who has it can enter stats.
   list where any event can be deleted — everything recomputes.
 - **Menu** → halftime/final report (Google Doc, print with Cmd+P), open
   spreadsheet, force sync.
+- **Rename a game**: Rename on the home screen's game row, or Menu → Rename
+  game. Renames the game's spreadsheet tabs too.
+- **Delete a game**: Delete on the home screen's game row, or Menu → Delete
+  game. After a confirmation it removes the game from the app and deletes its
+  tabs from the spreadsheet (game sheet, `Log_`, and the hidden `GraphData_` /
+  `Shots_` tabs). Report Docs and saved rosters are kept. Not undoable.
 - Works through wifi dropouts: every tap is saved locally first; the sheet
   catches up automatically (sync dot: green = synced, amber = pending,
   red = retrying).
@@ -110,7 +117,7 @@ divergences: the old sheet dropped a logged event; the engine counts it.
   at game setup with fixed geometry; each sync is ~6 `setValues` calls. The
   score-diff chart reads a hidden `GraphData_<game>` tab and is never
   recreated. Shot locations land in a hidden `Shots_<game>` tab; the two
-  team shot heat maps are plain cells (16x15 per team from column AE) whose
+  team shot heat maps are plain cells (16x15 per team from column Z) whose
   values and backgrounds are rewritten per sync — no chart object involved,
   so nothing can render blank. Records carry `shotChartVersion`; a game
   behind the current version is re-framed on its next sync.

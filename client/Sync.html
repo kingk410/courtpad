@@ -54,7 +54,13 @@ var Sync = (function () {
   function flush() {
     if (inFlight || !dirty) return;
     var payload = getPayload();
-    if (!payload) { dirty = false; notify(); return; }
+    if (!payload) {
+      // No game (left or deleted): drop pending work and any retry backoff
+      // so the next game's first bump schedules normally.
+      dirty = false; retryDelay = 0; lastError = null; oldestDirtyAt = null;
+      notify();
+      return;
+    }
 
     inFlight = true;
     dirty = false;         // set again by any mutation during the request
@@ -157,6 +163,29 @@ var Sync = (function () {
     try { localStorage.removeItem(LS_PREFIX + 'current'); } catch (e) { }
   }
 
+  /** Apply a server-side rename to a stored game without making it current. */
+  function renameLocal(gameId, rec) {
+    try {
+      var key = LS_PREFIX + 'game.' + gameId;
+      var raw = localStorage.getItem(key);
+      if (!raw) return;
+      var g = JSON.parse(raw);
+      g.rec = rec;
+      if (g.setup) g.setup.tabName = rec.tabName;
+      localStorage.setItem(key, JSON.stringify(g));
+    } catch (e) { }
+  }
+
+  /** Forget a game on this device (after it was deleted on the server). */
+  function removeLocal(gameId) {
+    try {
+      localStorage.removeItem(LS_PREFIX + 'game.' + gameId);
+      if (localStorage.getItem(LS_PREFIX + 'current') === gameId) {
+        localStorage.removeItem(LS_PREFIX + 'current');
+      }
+    } catch (e) { }
+  }
+
   function getPref(key, fallback) {
     try { return localStorage.getItem(LS_PREFIX + key) || fallback; } catch (e) { return fallback; }
   }
@@ -174,7 +203,7 @@ var Sync = (function () {
 
   return {
     init: init, bump: bump, flushNow: flushNow, call: call,
-    saveLocal: saveLocal, loadLocal: loadLocal,
+    saveLocal: saveLocal, loadLocal: loadLocal, removeLocal: removeLocal, renameLocal: renameLocal,
     currentGameId: currentGameId, clearCurrent: clearCurrent,
     getPref: getPref, setPref: setPref
   };

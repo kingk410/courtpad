@@ -182,8 +182,11 @@
     <button class="bigbtn secondary" id="m-sheet">Open spreadsheet</button>
     <button class="bigbtn secondary" id="m-half">📄 Halftime report</button>
     <button class="bigbtn secondary" id="m-final">📄 Final report</button>
+    <button class="bigbtn secondary" id="m-finalize">🏁 Mark game final</button>
     <button class="bigbtn secondary" id="m-sync">Force sync now</button>
+    <button class="bigbtn secondary" id="m-rename">✎ Rename game…</button>
     <button class="bigbtn secondary" id="m-home">⏏ Leave game (home)</button>
+    <button class="bigbtn secondary danger" id="m-delete">🗑 Delete game…</button>
     <button class="bigbtn secondary" id="m-close">Close</button>
     <div class="muted" id="m-status"></div>
   </div>
@@ -201,6 +204,21 @@
     <div class="modalrow">
       <button class="fbtn dismiss" id="plays-close">Cancel</button>
       <button class="fbtn" id="plays-save" style="background:var(--accent)">Save</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal" id="modal-rename">
+  <div class="modalbox" style="min-width:340px">
+    <h4>Rename game</h4>
+    <input type="text" id="rename-input" maxlength="80" autocomplete="off"
+      style="font:inherit; background:var(--panel2); color:var(--text);
+      border:1px solid var(--line); border-radius:8px; padding:10px;
+      -webkit-user-select:text; user-select:text">
+    <div class="muted" id="rename-status"></div>
+    <div class="modalrow">
+      <button class="fbtn dismiss" id="rename-cancel">Cancel</button>
+      <button class="fbtn" id="rename-save" style="background:var(--accent)">Rename</button>
     </div>
   </div>
 </div>

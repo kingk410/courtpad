@@ -55,6 +55,7 @@ var App = (function () {
             name: s.playerNames[t.code][num] || '',
             stats: s.players[t.code][num],
             min: (s.minutes[t.code] || {})[num] || 0,
+            on: (s.onCourt[t.code] || []).map(String).indexOf(String(num)) !== -1,
             pm: (s.plusMinus[t.code] || {})[num] || 0
           };
         });
@@ -69,6 +70,7 @@ var App = (function () {
     });
     return {
       quarterLabel: Engine.quarterLabel(s.quarter),
+      final: !!game.final,
       score: s.score,
       teams: teams,
       adv: s.adv,
@@ -135,9 +137,26 @@ var App = (function () {
     el.innerHTML = names.map(function (name, i) {
       var on = active === name;
       return '<button class="chip' + (on ? ' on' : '') + '" data-play="' +
-        esc(name) + '"' + (on ? ' disabled' : '') + '>' + esc(name) +
-        (on ? ' ●' : '') + '</button>';
+        esc(name) + '">' + esc(name) + (on ? ' ✕' : '') + '</button>';
     }).join('');
+  }
+
+  // Tapping the active play again calls it off: the play call is removed
+  // from the log, so it doesn't count as a call and whatever happens next
+  // (points, turnover) isn't credited to it.
+  function cancelActivePlay() {
+    var w = state.playWindow;
+    if (!w) return;
+    for (var i = game.events.length - 1; i >= 0; i--) {
+      var e = game.events[i];
+      if (e.type !== 'play') continue;
+      if (e.name === w.name) {
+        redoStack = [];
+        deleteEvent(e.id);
+        toast('Play off: ' + w.name);
+      }
+      return; // the most recent play call is the one that opened the window
+    }
   }
 
   function playStatsHtml() {
@@ -238,7 +257,7 @@ var App = (function () {
     $('g-colnameB').textContent = tB.name;
     $('g-ptsA').textContent = state.score[tA.code];
     $('g-ptsB').textContent = state.score[tB.code];
-    $('g-qchip').textContent = Engine.quarterLabel(state.quarter);
+    $('g-qchip').textContent = game.final ? 'FINAL' : Engine.quarterLabel(state.quarter);
 
     renderPlayers('g-playersA', tA, 'A');
     renderPlayers('g-playersB', tB, 'B');
@@ -248,7 +267,7 @@ var App = (function () {
     if (subMode) {
       line = subMode.stage === 'out'
         ? 'SUB (' + teamName(subMode.team) + '): tap player going OUT'
-        : 'SUB: tap player coming IN for #' + subMode.outNum;
+        : 'SUB: tap player coming IN for ' + esc(pLabel(subMode.team, subMode.outNum));
     } else if (sel) {
       var nm = state.playerNames[sel.team][sel.num] || '';
       line = '<b>#' + sel.num + ' ' + nm + '</b> — pick an action';
@@ -323,6 +342,15 @@ var App = (function () {
     return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   }
 
+  function isHome(teamCode) { return teamCode === teamOf(0).code; }
+
+  // "#23" for the opponent, "#23 Alex S." for my team (names are easier to
+  // recognize than numbers for the players I know).
+  function pLabel(teamCode, num) {
+    var name = isHome(teamCode) ? (state.playerNames[teamCode] || {})[String(num)] : '';
+    return '#' + num + (name ? ' ' + shortName(name) : '');
+  }
+
   // ---------------- selection & actions ----------------
 
   function tapPlayer(teamCode, num) {
@@ -332,7 +360,8 @@ var App = (function () {
       } else {
         if (num !== subMode.outNum) {
           pushEvent({ type: 'sub', team: teamCode, inNum: num, outNum: subMode.outNum });
-          toast('SUB: #' + num + ' in, #' + subMode.outNum + ' out');
+          toast('SUB: ' + pLabel(teamCode, num) + ' in, ' +
+            pLabel(teamCode, subMode.outNum) + ' out');
         }
         subMode = null;
       }
@@ -422,15 +451,16 @@ var App = (function () {
     var q = '', opts = [];
     var fu = followUp;
 
+    // Only the players currently on the floor (whole roster only if the
+    // game has no lineup data at all).
     function playerBtns(teamCode, exclude, tag) {
-      var on = state.onCourt[teamCode] || [];
-      var roster = Object.keys(state.players[teamCode]);
-      var order = (on.length ? on.concat(roster.filter(function (n) { return on.indexOf(n) === -1; }))
-        : roster).filter(function (n, i, a) { return a.indexOf(n) === i; });
-      return order
-        .filter(function (n) { return n !== exclude; })
+      var on = (state.onCourt[teamCode] || []).map(String);
+      var pool = on.length ? on : Object.keys(state.players[teamCode]);
+      return pool
+        .filter(function (n, i, a) { return a.indexOf(n) === i && n !== String(exclude); })
+        .sort(function (a, b) { return Number(a) - Number(b); })
         .map(function (n) {
-          return { label: '#' + n, team: teamCode, num: n, tag: tag };
+          return { label: pLabel(teamCode, n), team: teamCode, num: n, tag: tag };
         });
     }
 
@@ -440,12 +470,15 @@ var App = (function () {
       opts.push({ label: 'No assist', dismiss: true });
     } else if (fu.kind === 'rebound') {
       q = 'Rebound?';
-      var other = otherCode(fu.shooterTeam);
-      opts = playerBtns(fu.shooterTeam, null, 'oreb')
-        .map(function (o) { o.label = teamName(fu.shooterTeam).slice(0, 1) + ' ' + o.label; return o; })
-        .concat(playerBtns(other, null, 'dreb').map(function (o) {
-          o.label = teamName(other).slice(0, 1) + ' ' + o.label; return o;
-        }));
+      // One row per team, my team always on top.
+      game.setup.teams.forEach(function (t, ti) {
+        var off = t.code === fu.shooterTeam;
+        playerBtns(t.code, null, off ? 'oreb' : 'dreb').forEach(function (o) {
+          o.group = t.name + (off ? ' · OREB' : ' · DREB');
+          o.side = ti === 0 ? 'A' : 'B';
+          opts.push(o);
+        });
+      });
       opts.push({ label: 'Skip', dismiss: true });
     } else if (fu.kind === 'stealFrom') {
       q = 'Stolen from? (charges a turnover)';
@@ -464,11 +497,20 @@ var App = (function () {
     }
 
     $('g-fq').textContent = q;
-    var html = '';
+    var html = '', curGroup;
     opts.forEach(function (o, i) {
+      if (o.group !== curGroup) {
+        if (i) html += '</div>';
+        html += '<div class="fgroup">';
+        if (o.group) html += '<span class="fglabel team' + o.side + '">' + esc(o.group) + '</span>';
+        curGroup = o.group;
+      } else if (!i) {
+        html += '<div class="fgroup">';
+      }
       html += '<button class="fbtn' + (o.dismiss ? ' dismiss' : '') + '" data-fi="' + i + '">' +
         esc(o.label) + '</button>';
     });
+    if (opts.length) html += '</div>';
     $('g-fopts').innerHTML = html;
     box._opts = opts;
   }
@@ -507,7 +549,7 @@ var App = (function () {
 
   function openCourtModal(ev) {
     $('court-title').textContent = 'Where was the ' + (ev.shot === 3 ? '3' : '2') +
-      'PT ' + (ev.made ? 'make' : 'miss') + '? (#' + ev.num + ')';
+      'PT ' + (ev.made ? 'make' : 'miss') + '? (' + pLabel(ev.team, ev.num) + ')';
     $('modal-court').classList.add('visible');
   }
 
@@ -566,10 +608,77 @@ var App = (function () {
   // ---------------- confirm modal ----------------
 
   var confirmYes = null;
-  function ask(text, onYes) {
+  function ask(text, onYes, dangerLabel) {
     $('confirm-text').textContent = text;
     confirmYes = onYes;
+    var yes = $('confirm-yes');
+    yes.textContent = dangerLabel || 'Confirm';
+    yes.style.background = dangerLabel ? 'var(--red)' : 'var(--accent)';
     $('modal-confirm').classList.add('visible');
+  }
+
+  // ---------------- rename game ----------------
+  // Server renames the spreadsheet tabs and the registry entry; on success
+  // the copies on this device are updated to match.
+
+  var renameTarget = null; // {gameId, name}
+
+  function openRename(gameId, name) {
+    renameTarget = { gameId: gameId, name: name };
+    $('rename-input').value = name;
+    $('rename-status').textContent = '';
+    $('rename-save').disabled = false;
+    $('modal-rename').classList.add('visible');
+  }
+
+  function submitRename() {
+    var t = renameTarget;
+    if (!t) return;
+    var newName = $('rename-input').value.trim();
+    if (!newName) { $('rename-status').textContent = 'Enter a name.'; return; }
+    if (newName === t.name) { $('modal-rename').classList.remove('visible'); return; }
+    $('rename-status').textContent = 'Renaming…';
+    $('rename-save').disabled = true;
+    Sync.call('api_renameGame', t.gameId, newName).then(function (rec) {
+      if (game && game.gameId === t.gameId) {
+        game.rec = rec;
+        game.setup.tabName = rec.tabName;
+        Sync.saveLocal(game);
+      } else {
+        Sync.renameLocal(t.gameId, rec);
+      }
+      if (Sync.getPref('lastSsName', null) === t.name) Sync.setPref('lastSsName', rec.tabName);
+      $('modal-rename').classList.remove('visible');
+      toast('Renamed to "' + rec.tabName + '"');
+      if ($('screen-home').classList.contains('active')) initHome();
+    }).catch(function (err) {
+      $('rename-save').disabled = false;
+      $('rename-status').textContent = 'Rename failed: ' + err;
+    });
+  }
+
+  // ---------------- delete game ----------------
+  // Server first (registry entry + spreadsheet tabs); the local copy is only
+  // dropped once that succeeds, so a failed delete leaves everything intact.
+
+  function confirmDeleteGame(gameId, name, onStatus) {
+    ask('Delete "' + name + '"? This removes the game from the app and deletes ' +
+      'its tabs (game sheet and log) from the spreadsheet. This cannot be undone.',
+      function () {
+        onStatus('Deleting "' + name + '"…');
+        Sync.call('api_deleteGame', gameId).then(function () {
+          if (game && game.gameId === gameId) {
+            if (selTimer) clearTimeout(selTimer);
+            game = null; state = null;
+          }
+          Sync.removeLocal(gameId);
+          $('modal-menu').classList.remove('visible');
+          initHome();
+          toast('Deleted "' + name + '"');
+        }).catch(function (err) {
+          onStatus('Delete failed: ' + err);
+        });
+      }, 'Delete');
   }
 
   // ---------------- event log screen ----------------
@@ -621,13 +730,26 @@ var App = (function () {
       var html = '';
       games.forEach(function (g, i) {
         html += '<div class="gamerow"><div>' + esc(g.tabName) +
-          '<div class="muted">' + (g.createdAt || '').slice(0, 10) + '</div></div>' +
-          '<button class="topbtn" data-gi="' + i + '">Open</button></div>';
+          '<div class="muted">' + (g.createdAt || '').slice(0, 10) +
+          (g.final ? ' · Final' : '') + '</div></div>' +
+          '<div class="rowbtns"><button class="topbtn danger" data-act="del" data-gi="' + i +
+          '">Delete</button><button class="topbtn" data-act="ren" data-gi="' + i +
+          '">Rename</button><button class="topbtn" data-act="open" data-gi="' + i +
+          '">Open</button></div></div>';
       });
       $('home-games').innerHTML = html;
       var btns = $('home-games').querySelectorAll('button');
       for (var i = 0; i < btns.length; i++) {
-        btns[i].onclick = function () { openRemoteGame(games[Number(this.dataset.gi)]); };
+        btns[i].onclick = function () {
+          var g = games[Number(this.dataset.gi)];
+          if (this.dataset.act === 'del') {
+            confirmDeleteGame(g.gameId, g.tabName, function (msg) { toast(msg); });
+          } else if (this.dataset.act === 'ren') {
+            openRename(g.gameId, g.tabName);
+          } else {
+            openRemoteGame(g);
+          }
+        };
       }
     }).catch(function (err) {
       $('home-games').innerHTML = '<div class="muted">Could not load games: ' + esc(err) + '</div>';
@@ -647,6 +769,7 @@ var App = (function () {
         setup: res.record.setup,
         events: parsed.events,
         revision: res.record.appliedRevision,
+        final: !!res.record.final,
         trackShots: true
       };
       loadGameObject(g);
@@ -710,9 +833,11 @@ var App = (function () {
     // In-game play chips: tap = "we're running this play" for my team.
     $('g-plays').addEventListener('click', function (e) {
       var chip = e.target.closest('.chip');
-      if (!chip || chip.disabled) return;
+      if (!chip) return;
       dismissFollowUp();
-      pushEvent({ type: 'play', team: teamOf(0).code, name: chip.dataset.play });
+      var playName = chip.dataset.play;
+      if (state.playWindow && state.playWindow.name === playName) { cancelActivePlay(); return; }
+      pushEvent({ type: 'play', team: teamOf(0).code, name: playName });
     });
 
     // Setup
@@ -752,6 +877,7 @@ var App = (function () {
     });
     // Quarter, undo, menu, log
     $('g-qchip').onclick = function () {
+      if (game.final) { toast('Game is final — reopen it from the menu to keep scoring.'); return; }
       var label = Engine.quarterLabel(state.quarter);
       ask('End ' + label + '?', function () {
         pushEvent({ type: 'quarterEnd' }); // stamped with the final clock reading
@@ -777,6 +903,7 @@ var App = (function () {
     // Menu
     $('g-menu').onclick = function () {
       $('m-status').textContent = '';
+      renderFinalizeBtn();
       $('modal-menu').classList.add('visible');
     };
     $('m-close').onclick = function () { $('modal-menu').classList.remove('visible'); };
@@ -787,10 +914,41 @@ var App = (function () {
     $('m-final').onclick = function () { generateReport('FINAL'); };
     $('m-sync').onclick = function () {
       $('m-status').textContent = 'Syncing…';
+      // A new revision, so the server really repaints (it skips revisions it
+      // has already applied) — this is what picks up a new sheet layout.
+      game.revision++;
+      Sync.saveLocal(game);
       Sync.bump();
       Sync.flushNow().then(function (ok) {
         $('m-status').textContent = ok ? 'Synced.' : 'Sync failing — will keep retrying.';
       });
+    };
+    function renderFinalizeBtn() {
+      $('m-finalize').textContent = game.final ? '↩ Reopen game (not final)' : '🏁 Mark game final';
+    }
+    function setFinal(isFinal) {
+      if (isFinal && clockState().running) toggleClock();
+      mutate(function () { game.final = isFinal; }); // new revision -> synced to the sheet
+      renderFinalizeBtn();
+      $('m-status').textContent = isFinal
+        ? 'Game marked final — the spreadsheet tab is coloured by the result.'
+        : 'Game reopened.';
+    }
+    $('m-finalize').onclick = function () {
+      if (game.final) { setFinal(false); return; }
+      ask('Mark this game as final? The spreadsheet shows FINAL and its tab turns green ' +
+        'for a win or red for a loss. You can still make corrections, or reopen it.',
+        function () { setFinal(true); });
+    };
+    $('m-rename').onclick = function () {
+      $('modal-menu').classList.remove('visible');
+      openRename(game.gameId, game.rec ? game.rec.tabName : '');
+    };
+    $('rename-save').onclick = submitRename;
+    $('rename-cancel').onclick = function () { $('modal-rename').classList.remove('visible'); };
+    $('m-delete').onclick = function () {
+      confirmDeleteGame(game.gameId, game.rec ? game.rec.tabName : 'this game',
+        function (msg) { $('m-status').textContent = msg; });
     };
     $('m-home').onclick = function () {
       $('modal-menu').classList.remove('visible');

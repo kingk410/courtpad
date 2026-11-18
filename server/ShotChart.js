@@ -20,7 +20,7 @@
  */
 
 var SHOT_CHART_VERSION = 2;
-var SHOT_COL = 31;           // AE: team A block; team B at SHOT_COL + SHOT_BLOCK_W
+var SHOT_COL = 26;           // Z: team A block (box score is A:X, Y is a spacer); team B at SHOT_COL + SHOT_BLOCK_W
 var GRID_COLS = 16, GRID_ROWS = 15;
 var SHOT_BLOCK_W = GRID_COLS + 1;   // grid + 1 gap column
 var SHOT_TABLE_ROWS = 7;     // title, header, 4 zone rows, note — grid starts below
@@ -131,7 +131,7 @@ function ensureShotColumns_(sheet) {
 /** Frame for both teams: zone table, grid formatting, court borders, legend. */
 function paintShotFrame_(sheet, geo, setup) {
   ensureShotColumns_(sheet);
-  var S = geo.subStart;
+  var S = geo.shotRow;
   var G = S + SHOT_TABLE_ROWS;
   var tones = baseTones_();
   sheet.setRowHeights(G, GRID_ROWS, SHOT_CELL_PX);
@@ -156,14 +156,16 @@ function paintShotFrame_(sheet, geo, setup) {
     sheet.getRange(S + 2, c, SHOT_ZONES.length, 1).setValues(
       SHOT_ZONES.map(function (zn) { return [zn[0]]; }));
     sheet.getRange(S + 2, c + 4, SHOT_ZONES.length, 12).setHorizontalAlignment('center');
+    sheet.getRange(S + 2, c, SHOT_ZONES.length, 8).setNumberFormat('@'); // zone, "3-7"
     sheet.getRange(S + 2, c + 8, SHOT_ZONES.length, 4).setNumberFormat('0%');
+    sheet.getRange(S + 2, c + 12, SHOT_ZONES.length, 4).setNumberFormat('0');
     sheet.getRange(S + 1 + SHOT_ZONES.length, c, 1, GRID_COLS).setFontWeight('bold');
     sheet.getRange(S + 2 + SHOT_ZONES.length, c, 1, GRID_COLS).merge()
       .setFontColor('#888888').setFontStyle('italic').setFontSize(9);
 
     // Grid: base tones, small centered text, court borders.
     var grid = sheet.getRange(G, c, GRID_ROWS, GRID_COLS);
-    grid.setBackgrounds(tones).setFontSize(8).setFontColor('#333333')
+    grid.setNumberFormat('@').setBackgrounds(tones).setFontSize(8).setFontColor('#333333')
       .setHorizontalAlignment('center').setVerticalAlignment('middle')
       .setBorder(true, true, true, true, false, false, '#455a64', SpreadsheetApp.BorderStyle.SOLID_MEDIUM);
     // Key: x 19..31 ft, y 0..19 ft -> grid cols 6..9, rows 0..5 (cell ~3.1 ft).
@@ -185,22 +187,6 @@ function createShotCharts_(ss, rec, sheet, geo) {
   rec.shotChartVersion = SHOT_CHART_VERSION;
 }
 
-/** Remove the v1 scatter charts / hidden tab / 4-column frame, if present. */
-function clearShotChartsV1_(ss, rec, sheet, geo) {
-  sheet.getCharts().forEach(function (ch) {
-    if (ch.getContainerInfo().getAnchorColumn() >= SHOT_COL) sheet.removeChart(ch);
-  });
-  if (rec.shotTabName) {
-    var tab = ss.getSheetByName(rec.shotTabName);
-    if (tab) ss.deleteSheet(tab);
-    delete rec.shotTabName;
-  }
-  var old = sheet.getRange(geo.subStart, SHOT_COL, SHOT_TABLE_ROWS, 10);
-  old.breakApart();
-  old.clearContent();
-  old.clearFormat();
-}
-
 /**
  * Bring a game onto the current shot-chart layout. Called from api_syncGame
  * when the record's version is behind. The version is recorded before
@@ -211,9 +197,7 @@ function retrofitShotHeatmap_(ss, rec) {
   var sheet = ss.getSheetByName(rec.tabName);
   if (!sheet) return;
   try {
-    var geo = geometry_(rec.setup);
-    clearShotChartsV1_(ss, rec, sheet, geo);
-    paintShotFrame_(sheet, geo, rec.setup);
+    paintShotFrame_(sheet, geometry_(rec.setup), rec.setup);
   } catch (err) {
     Logger.log('Shot heat map retrofit failed for ' + rec.tabName + ': ' + err);
   }
@@ -221,7 +205,7 @@ function retrofitShotHeatmap_(ss, rec) {
 
 /** Values-only: zone tables + heat grids (called from renderSnapshot_). */
 function writeShotHeatmap_(sheet, geo, setup, snap) {
-  var S = geo.subStart;
+  var S = geo.shotRow;
   var G = S + SHOT_TABLE_ROWS;
   var tones = baseTones_();
   for (var t = 0; t < 2; t++) {
